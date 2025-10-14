@@ -8,7 +8,7 @@ import cv2
 
 from . import Dataset, SignalData, CameraData
 from ..signals import *
-from vsmodule.consts import Globals
+from ..consts import Globals
 
 
 ######### TODO

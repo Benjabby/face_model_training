@@ -14,7 +14,7 @@ from biosppy.signals import ecg as bioecg, resp as bioresp
 from scipy.ndimage import uniform_filter, gaussian_filter1d
 # import neurokit2 as nk
 
-from vsmodule.consts import Globals
+from ..consts import Globals
 
 def _spectro(data, fs, win_size, stride, minHz, maxHz):
     segment = (win_size * fs)

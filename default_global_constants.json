@@ -1,0 +1,11 @@
+{
+	"DEFAULT_PREV":true,
+	"DEFAULT_COL_TYPE":"standard",
+	"DEFAULT_HR": 80,
+	
+	"HR_MIN_HZ": 0.65,
+	"HR_MAX_HZ": 3,
+	
+	"BR_MIN_HZ": 0.1,
+	"BR_MAX_HZ": 0.7
+}
