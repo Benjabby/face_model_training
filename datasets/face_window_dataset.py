@@ -15,11 +15,8 @@ supported: pre-face-detection transforms that act on the full frame, and
 post-face-detection transforms that operate on the cropped face prior to
 conversion to tensors.  Each sample additionally includes a heart-rate sequence
 aligned with the returned frame window, producing batches shaped
-``(B, window_size, 6, image_size, image_size)`` for faces,
-``(B, window_size, 5)`` for face metadata, and ``(B, window_size)`` for heart
-rates.  The metadata encodes visibility along with bounding-box center
-coordinates and dimensions normalized by the larger of the source frame's width
-or height.
+``(B, window_size, 3, image_size, image_size)`` for faces and
+``(B, window_size)`` for heart rates.
 """
 
 from __future__ import annotations
@@ -168,7 +165,7 @@ class RandomFaceWindowDataset(TorchDataset):
                 f"Video '{entry.video_path}' does not contain enough frames for a window"
             )
         start_frame = int(rng.integers(0, max_start + 1))
-        frames, metadata = self._read_face_window(entry, start_frame, rng)
+        frames = self._read_face_window(entry, start_frame, rng)
         heart_rates = self._slice_heart_rates(entry, start_frame)
         return {
             "frames": frames,
@@ -176,7 +173,6 @@ class RandomFaceWindowDataset(TorchDataset):
             "video_index": entry.dataset_index,
             "start_frame": start_frame,
             "heart_rates": heart_rates,
-            "face_metadata": metadata,
         }
 
     # ------------------------------------------------------------------
@@ -258,21 +254,17 @@ class RandomFaceWindowDataset(TorchDataset):
 
     def _read_face_window(
         self, entry: _VideoEntry, start_frame: int, rng: np.random.Generator
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         capture = cv2.VideoCapture(entry.video_path)
         try:
             if start_frame > 0:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
             frames = torch.empty(
-                (self.window_size, 6, self.image_size, self.image_size),
+                (self.window_size, 3, self.image_size, self.image_size),
                 dtype=torch.float32,
             )
-            metadata = torch.empty((self.window_size, 5), dtype=torch.float32)
-            last_frame_bgr: Optional[np.ndarray] = None
-
-            self._reset_transform_state(self._pre_face_transforms, rng)
-            self._reset_transform_state(self._post_face_transforms, rng)
+            last_bbox: Optional[Tuple[int, int, int, int]] = None
 
             for frame_idx in range(self.window_size):
                 success, frame_bgr = capture.read()
@@ -282,54 +274,13 @@ class RandomFaceWindowDataset(TorchDataset):
                     )
 
                 frame_bgr = self._apply_pre_transforms(frame_bgr, rng)
-                bbox, visible = self._detect_face(frame_bgr)
+                bbox = self._detect_face(frame_bgr, last_bbox)
+                last_bbox = bbox
+                face_rgb = self._extract_face(frame_bgr, bbox)
+                face_tensor = self._apply_post_transforms(face_rgb, rng)
+                frames[frame_idx].copy_(face_tensor)
 
-                if bbox is None:
-                    face_rgb = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
-                    base_tensor = self._to_normalized_tensor(face_rgb)
-                    face_tensor = base_tensor
-                    visibility_scale: Optional[float] = 0.0
-                    used_bbox: Optional[Tuple[int, int, int, int]] = None
-                else:
-                    face_rgb, used_bbox = self._extract_face(frame_bgr, bbox)
-                    base_tensor = self._to_normalized_tensor(face_rgb)
-                    if self._post_face_transform_funcs:
-                        face_tensor, visibility_scale = self._apply_post_transforms(
-                            face_rgb, rng
-                        )
-                    else:
-                        face_tensor = base_tensor
-                        visibility_scale = 1.0
-
-                if last_frame_bgr is None or used_bbox is None:
-                    diff_tensor = torch.zeros_like(base_tensor)
-                else:
-                    prev_face_rgb, _ = self._extract_face(last_frame_bgr, used_bbox)
-                    prev_base_tensor = self._to_normalized_tensor(prev_face_rgb)
-                    diff_tensor = base_tensor - prev_base_tensor
-
-                frames[frame_idx, 0:3].copy_(face_tensor)
-                frames[frame_idx, 3:6].copy_(diff_tensor)
-
-                if used_bbox is None:
-                    metadata[frame_idx].zero_()
-                else:
-                    frame_height, frame_width = frame_bgr.shape[:2]
-                    max_dim = float(max(frame_width, frame_height))
-                    cx = used_bbox[0] + used_bbox[2] / 2.0
-                    cy = used_bbox[1] + used_bbox[3] / 2.0
-                    visibility_value = 1.0 if visible else 0.0
-                    if visibility_scale is not None:
-                        visibility_value *= float(visibility_scale)
-                    metadata[frame_idx, 0] = visibility_value
-                    metadata[frame_idx, 1] = float(cx / max_dim)
-                    metadata[frame_idx, 2] = float(cy / max_dim)
-                    metadata[frame_idx, 3] = float(used_bbox[2] / max_dim)
-                    metadata[frame_idx, 4] = float(used_bbox[3] / max_dim)
-
-                last_frame_bgr = frame_bgr
-
-            return frames, metadata
+            return frames
         finally:
             capture.release()
 
@@ -348,23 +299,11 @@ class RandomFaceWindowDataset(TorchDataset):
 
     def _apply_post_transforms(
         self, face_rgb: np.ndarray, rng: np.random.Generator
-    ) -> Tuple[torch.Tensor, Optional[float]]:
-        data: ArrayLike = face_rgb
-        visibility_scale: Optional[float] = 1.0
-        for transform in self._post_face_transform_funcs:
-            result = transform(data, rng)
-            if isinstance(result, tuple):
-                data, visibility = result  # type: ignore[assignment]
-                if visibility is not None:
-                    visibility_scale = (
-                        float(visibility_scale) * float(visibility)
-                        if visibility_scale is not None
-                        else float(visibility)
-                    )
-            else:
-                data = result
-        tensor = self._to_normalized_tensor(data)
-        return tensor, visibility_scale
+    ) -> torch.Tensor:
+        transformed = self._apply_transforms(
+            self._post_face_transform_funcs, face_rgb, rng
+        )
+        return self._to_normalized_tensor(transformed)
 
     def _apply_transforms(
         self,
@@ -377,32 +316,13 @@ class RandomFaceWindowDataset(TorchDataset):
             result = transform(result, rng)
         return result
 
-    def _reset_transform_state(
-        self,
-        transforms: Sequence[Callable[[ArrayLike], ArrayLike]],
-        rng: np.random.Generator,
-    ) -> None:
-        for transform in transforms:
-            reset_fn = getattr(transform, "reset", None)
-            if callable(reset_fn):
-                try:
-                    reset_fn(window_size=self.window_size, rng=rng)
-                except TypeError:
-                    try:
-                        reset_fn(self.window_size, rng)
-                    except TypeError:
-                        try:
-                            reset_fn(rng=rng)
-                        except TypeError:
-                            reset_fn()
-
     def _detect_face(
         self,
         frame_bgr: np.ndarray,
-    ) -> Tuple[Optional[Tuple[int, int, int, int]], bool]:
+        previous_bbox: Optional[Tuple[int, int, int, int]],
+    ) -> Tuple[int, int, int, int]:
         detector = self.face_detector
         bbox: Optional[Tuple[int, int, int, int]] = None
-        visible = False
 
         boxes, scores = detector.process(frame_bgr)
         boxes = np.asarray(boxes)
@@ -419,13 +339,21 @@ class RandomFaceWindowDataset(TorchDataset):
             x = int(round(x0))
             y = int(round(y0))
             bbox = (x, y, w, h)
-            visible = True
+        elif previous_bbox is not None:
+            bbox = previous_bbox
 
-        return bbox, visible
+        if bbox is None:
+            h, w = frame_bgr.shape[:2]
+            side = min(h, w)
+            x = (w - side) // 2
+            y = (h - side) // 2
+            bbox = (x, y, side, side)
+
+        return bbox
 
     def _extract_face(
         self, frame_bgr: np.ndarray, bbox: Tuple[int, int, int, int]
-    ) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    ) -> np.ndarray:
         x, y, w, h = bbox
         h_img, w_img = frame_bgr.shape[:2]
         x = max(0, x)
@@ -445,10 +373,6 @@ class RandomFaceWindowDataset(TorchDataset):
             cy = h_img // 2
             half = side // 2
             face = frame_bgr[cy - half : cy + half, cx - half : cx + half]
-            x = cx - half
-            y = cy - half
-            w = face.shape[1]
-            h = face.shape[0]
 
         interpolation = (
             cv2.INTER_AREA
@@ -457,7 +381,7 @@ class RandomFaceWindowDataset(TorchDataset):
         )
         face = cv2.resize(face, (self.image_size, self.image_size), interpolation=interpolation)
         face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-        return face, (x, y, w, h)
+        return face
 
     def _normalize_transforms(
         self, transforms: Optional[TransformType]
