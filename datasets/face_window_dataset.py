@@ -4,7 +4,9 @@ This module provides a :class:`RandomFaceWindowDataset` that samples fixed-size
 temporal windows of cropped facial regions from multiple physiological video
 datasets.  Each sample is composed of ``window_size`` consecutive frames and is
 designed to integrate with PyTorch's :class:`~torch.utils.data.DataLoader` in
-order to deliver batches shaped ``(B, window_size, 3, image_size, image_size)``.
+order to deliver batches shaped ``(B, window_size, 6, image_size, image_size)``
+for the face tensors and ``(B, window_size, 5)`` for the associated face
+metadata.
 
 The dataset randomly chooses a source video from the configured datasets and a
 valid starting frame for every request, enabling arbitrarily long epochs without
@@ -360,6 +362,8 @@ class RandomFaceWindowDataset(TorchDataset):
         h = max(1, h)
         x2 = min(w_img, x + w)
         y2 = min(h_img, y + h)
+        w = max(1, x2 - x)
+        h = max(1, y2 - y)
 
         face = frame_bgr[y:y2, x:x2]
         if face.size == 0:
