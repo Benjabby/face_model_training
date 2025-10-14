@@ -179,6 +179,8 @@ class _CameraDataFrames(CameraData):
         
         self.curr_frame = 0
         
+        if timestamps is None:
+            breakpoint()
         assert timestamps is not None, "_CameraDataFrames must be instantiated with timestamps"
         if len(timestamps)<self.nframes:
             raise RuntimeError("Timestamps provided for for video at '{}' do not contain enough entries for the frames of the video file ({} timestamps for {} frames)".format(path,len(timestamps),self.nframes))
