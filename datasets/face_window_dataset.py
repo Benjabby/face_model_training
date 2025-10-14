@@ -210,19 +210,28 @@ class RandomFaceWindowDataset(TorchDataset):
         dataset_index: int,
         video_path: str,
     ) -> Optional[_VideoEntry]:
-        camera = CameraData.create(video_path)
+        try:
+            ground_truth, video_times = dataset.load_instance(
+                dataset_index, include_video=False
+            )
+        except Exception:
+            return None
+
+        timestamps = None
+        if video_times is not None:
+            timestamps = np.asarray(video_times, dtype=np.float64)
+
+        camera: Optional[CameraData] = None
+        try:
+            camera = CameraData.create(video_path, timestamps=timestamps)
+        except Exception:
+            return None
+
         try:
             if camera.nframes < self.window_size:
                 return None
 
             frame_times = np.asarray(camera.times)
-
-            try:
-                ground_truth, _ = dataset.load_instance(
-                    dataset_index, include_video=False
-                )
-            except Exception:
-                return None
 
             hr_signal = getattr(ground_truth, "HR", None)
             if hr_signal is None:
@@ -241,7 +250,8 @@ class RandomFaceWindowDataset(TorchDataset):
                 heart_rates=heart_rates,
             )
         finally:
-            camera.close()
+            if camera is not None:
+                camera.close()
 
     def _slice_heart_rates(self, entry: _VideoEntry, start_frame: int) -> torch.Tensor:
         end_frame = start_frame + self.window_size
