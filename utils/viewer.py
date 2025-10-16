@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import torch
 
-from datasets.face_window_dataset import RandomFaceWindowDataset
+from ..datasets.face_window_dataset import RandomFaceWindowDataset
 
 
 def _tensor_to_bgr(frame_tensor: torch.Tensor) -> np.ndarray:
