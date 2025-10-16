@@ -292,15 +292,29 @@ class RandomFrameBlackout:
         return frame_uint8, 1.0
 
 
-def default_pre_face_transforms() -> Sequence[object]:
-    """Return a set of gentle default pre-face transforms."""
+def _scale_probability(base_probability: float, scale: float) -> float:
+    scaled = base_probability * scale
+    if scaled <= 0.0:
+        return 0.0
+    if scaled >= 1.0:
+        return 1.0
+    return scaled
+
+
+def default_pre_face_transforms(
+    probability_scale: float = 0.5,
+) -> Sequence[object]:
+    """Return the default pre-face transforms with scaled probabilities."""
+
+    if probability_scale < 0.0:
+        raise ValueError("probability_scale must be non-negative")
 
     return (
-        RandomHorizontalFlip(),
-        RandomGaussianNoise(),
-        RandomColorJitter(),
-        RandomSmallAffine(),
-        RandomWindowAffine(),
+        RandomHorizontalFlip(prob=_scale_probability(0.5, probability_scale)),
+        RandomGaussianNoise(prob=_scale_probability(0.5, probability_scale)),
+        RandomColorJitter(prob=_scale_probability(0.7, probability_scale)),
+        RandomSmallAffine(prob=_scale_probability(0.5, probability_scale)),
+        RandomWindowAffine(prob=_scale_probability(0.35, probability_scale)),
     )
 
 
@@ -308,11 +322,17 @@ def default_post_face_transforms(
     window_size: int,
     blackout_probability: float = 0.15,
     min_mean_visibility: float = 0.6,
+    probability_scale: float = 0.5,
 ) -> Sequence[object]:
-    """Return default post-face transforms, including randomized blackouts."""
+    """Return default post-face transforms with scaled blackout probability."""
+
+    if probability_scale < 0.0:
+        raise ValueError("probability_scale must be non-negative")
 
     blackout = RandomFrameBlackout(
-        blackout_probability=blackout_probability,
+        blackout_probability=_scale_probability(
+            blackout_probability, probability_scale
+        ),
         min_mean_visibility=min_mean_visibility,
     )
     blackout.reset(window_size=window_size, rng=np.random.default_rng())
