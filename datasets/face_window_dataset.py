@@ -242,10 +242,76 @@ class RandomFaceWindowDataset(TorchDataset):
     def available_datasets(self) -> Sequence[str]:
         return tuple(self.datasets.keys())
 
+    def train_test_split(
+        self,
+        train_proportion: float,
+        *,
+        seed: Optional[int] = None,
+    ) -> Tuple["RandomFaceWindowDataset", "RandomFaceWindowDataset"]:
+        """Split the dataset into training and testing subsets per video.
+
+        Parameters
+        ----------
+        train_proportion:
+            Proportion of videos assigned to the training subset.  Must be in the
+            open interval ``(0.0, 1.0)``.
+        seed:
+            Optional random seed controlling the shuffling applied before
+            splitting.  When omitted the dataset's own seed is reused.
+
+        Returns
+        -------
+        Tuple[RandomFaceWindowDataset, RandomFaceWindowDataset]
+            A pair of datasets containing disjoint sets of videos.
+        """
+
+        if not 0.0 < train_proportion < 1.0:
+            raise ValueError("train_proportion must be between 0 and 1")
+
+        if len(self._videos) < 2:
+            raise ValueError("At least two videos are required to perform a split")
+
+        base_seed = seed if seed is not None else self.seed
+        rng = np.random.default_rng(base_seed)
+
+        indices = np.arange(len(self._videos))
+        rng.shuffle(indices)
+
+        split_idx = int(round(len(indices) * train_proportion))
+        split_idx = max(1, min(len(indices) - 1, split_idx))
+
+        train_indices = indices[:split_idx]
+        test_indices = indices[split_idx:]
+
+        train_videos = [self._videos[int(idx)] for idx in train_indices]
+        test_videos = [self._videos[int(idx)] for idx in test_indices]
+
+        train_seed = None if base_seed is None else int(base_seed) + 1
+        test_seed = None if base_seed is None else int(base_seed) + 2
+
+        train_dataset = self._clone_with_videos(train_videos, seed=train_seed)
+        test_dataset = self._clone_with_videos(test_videos, seed=test_seed)
+
+        return train_dataset, test_dataset
+
     # ------------------------------------------------------------------
     # Internal helpers
     def _get_rng(self) -> np.random.Generator:
         return self.rng
+
+    def _clone_with_videos(
+        self,
+        videos: Sequence[_VideoEntry],
+        *,
+        seed: Optional[int],
+    ) -> "RandomFaceWindowDataset":
+        clone = self.__class__.__new__(self.__class__)
+        clone.__dict__ = self.__dict__.copy()
+        clone._videos = list(videos)
+        clone._camera_cache = {}
+        clone.seed = seed
+        clone.rng = np.random.default_rng(seed)
+        return clone
 
     def _spawn_index_rng(self, index: int) -> np.random.Generator:
         if index < 0:
