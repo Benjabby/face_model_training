@@ -14,9 +14,10 @@ valid starting frame for every request, enabling arbitrarily long epochs without
 repeating windows deterministically.  Two optional augmentation stages are
 supported: pre-face-detection transforms that act on the full frame, and
 post-face-detection transforms that operate on the cropped face prior to
-conversion to tensors.  Each sample additionally includes a heart-rate sequence
-aligned with the returned frame window, producing batches shaped
-``(B, window_size)`` for heart rates.
+conversion to tensors.  Each sample additionally includes a heart-rate target
+aligned with the returned frame window, delivered either as the full
+``(B, window_size)`` sequence or as a scalar ``(B,)`` mean depending on the
+configured output mode.
 """
 
 from __future__ import annotations
@@ -87,6 +88,9 @@ class RandomFaceWindowDataset(TorchDataset):
     face_detector_kwargs:
         Optional dictionary of keyword arguments forwarded to the detector
         factory.
+    heart_rate_as_scalar:
+        When ``True`` (default), return the mean heart rate for each sampled
+        window as a scalar tensor instead of the full per-frame signal.
     seed:
         Optional seed forwarded to :func:`numpy.random.default_rng` to
         initialize the dataset's random generator.
@@ -110,6 +114,7 @@ class RandomFaceWindowDataset(TorchDataset):
         post_face_transforms: Optional[TransformType] = None,
         face_detector: str = "yunet",
         face_detector_kwargs: Optional[Dict[str, object]] = None,
+        heart_rate_as_scalar: bool = True,
         seed: Optional[int] = None,
         cache_cameras: bool = True,
     ) -> None:
@@ -139,6 +144,7 @@ class RandomFaceWindowDataset(TorchDataset):
             )
         self.pre_face_transforms = pre_face_transforms
         self.post_face_transforms = post_face_transforms
+        self._heart_rate_as_scalar = heart_rate_as_scalar
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         self._cache_cameras = cache_cameras
@@ -554,7 +560,12 @@ class RandomFaceWindowDataset(TorchDataset):
             raise RuntimeError(
                 "Heart rate annotations do not cover the requested window"
             )
-        return torch.as_tensor(heart_rates, dtype=torch.float32)
+        values = torch.as_tensor(heart_rates, dtype=torch.float32)
+        if self._heart_rate_as_scalar:
+            if values.numel() == 0:
+                raise RuntimeError("No heart-rate values available for the requested window")
+            return values.mean()
+        return values
 
     def _read_face_window(
         self,

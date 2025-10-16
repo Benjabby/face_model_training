@@ -32,18 +32,37 @@ else:  # pragma: no cover - fallback for older PyTorch versions
 def masked_mse_loss(predictions: Tensor, targets: Tensor, visibility: Tensor) -> Tensor:
     """Compute a visibility-weighted mean squared error."""
 
-    if predictions.shape != targets.shape:
-        raise ValueError("predictions and targets must share the same shape")
+    if predictions.shape == targets.shape:
+        weights = visibility.to(dtype=predictions.dtype)
+        if weights.shape != predictions.shape:
+            raise ValueError("visibility must align with predictions for masking")
 
-    weights = visibility.to(dtype=predictions.dtype)
-    if weights.shape != predictions.shape:
-        raise ValueError("visibility must align with predictions for masking")
+        squared_error = (predictions - targets) ** 2
+        clamped_weights = weights.clamp_min(0.0)
+        weighted_error = squared_error * clamped_weights
+        normalizer = clamped_weights.sum().clamp_min(torch.finfo(predictions.dtype).eps)
+        return weighted_error.sum() / normalizer
 
-    squared_error = (predictions - targets) ** 2
-    clamped_weights = weights.clamp_min(0.0)
-    weighted_error = squared_error * clamped_weights
-    normalizer = clamped_weights.sum().clamp_min(torch.finfo(predictions.dtype).eps)
-    return weighted_error.sum() / normalizer
+    # Support scalar predictions (B,) where visibility is [B, S].
+    if predictions.dim() == targets.dim() == 1:
+        pred = predictions.view(-1)
+        tgt = targets.view(-1).to(dtype=pred.dtype, device=pred.device)
+
+        if visibility.dim() == 2:
+            weights = visibility.to(dtype=pred.dtype, device=pred.device).clamp_min(0.0).sum(dim=1)
+        elif visibility.dim() == 1:
+            weights = visibility.to(dtype=pred.dtype, device=pred.device).clamp_min(0.0)
+        else:
+            raise ValueError("visibility must be 1D or 2D for scalar predictions")
+
+        if weights.shape[0] != pred.shape[0]:
+            raise ValueError("visibility must align with batch size for scalar predictions")
+
+        squared_error = (pred - tgt) ** 2
+        normalizer = weights.sum().clamp_min(torch.finfo(pred.dtype).eps)
+        return (squared_error * weights).sum() / normalizer
+
+    raise ValueError("predictions and targets must share the same shape")
 
 
 def _resolve_device(device: Optional[torch.device]) -> torch.device:
