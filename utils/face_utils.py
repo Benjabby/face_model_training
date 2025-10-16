@@ -3,6 +3,7 @@ import os
 from typing import Tuple, List
 import numpy as np
 import cv2
+import torch
 
 class BaseDetector:
     """
@@ -119,6 +120,24 @@ class YuNetDetector(BaseDetector):
         # Cache of last (W,H) set on the detector
         self._last_size: Tuple[int, int] = (640, 480)
 
+        self._using_cuda = False
+        if hasattr(cv2, "cuda") and hasattr(cv2.cuda, "getCudaEnabledDeviceCount"):
+            device_count = int(cv2.cuda.getCudaEnabledDeviceCount())
+            if device_count > 0 and hasattr(cv2, "dnn"):
+                backend = getattr(cv2.dnn, "DNN_BACKEND_CUDA", None)
+                target_fp16 = getattr(cv2.dnn, "DNN_TARGET_CUDA_FP16", None)
+                target = getattr(cv2.dnn, "DNN_TARGET_CUDA", None)
+                if backend is not None and target is not None:
+                    try:
+                        if hasattr(self.det, "setPreferableBackend"):
+                            self.det.setPreferableBackend(int(backend))
+                        if hasattr(self.det, "setPreferableTarget"):
+                            prefer = int(target_fp16) if target_fp16 is not None else int(target)
+                            self.det.setPreferableTarget(prefer)
+                        self._using_cuda = True
+                    except cv2.error:
+                        self._using_cuda = False
+
         try:
             cv2.setUseOptimized(True)
         except Exception:
@@ -208,20 +227,24 @@ class SCRFDDetector(BaseDetector):
     def __init__(self, model_path: str,
                  score_thresh: float = 0.3,
                  nms_thresh: float = 0.4,
-                 input_size: tuple[int, int] | None = (640, 640)):
+                 input_size: tuple[int, int] | None = (640, 640),
+                 ctx_id: int | None = None):
         import insightface
         if not os.path.exists(model_path):
             raise FileNotFoundError(model_path)
         self.det = insightface.model_zoo.get_model(model_path)   # ONNX path
         # Many builds support det_thresh + det_size here (and ignore nms thresh)
         # Some ignore nms here; that's fine — internal postproc handles it.
-        self.det.prepare(ctx_id=-1,
+        if ctx_id is None:
+            ctx_id = 0 if torch.cuda.is_available() else -1
+        self.det.prepare(ctx_id=int(ctx_id),
                          det_thresh=float(score_thresh),
                          det_size=tuple(input_size) if input_size else None)
         # Keep copies for factory consistency
         self.score_thresh = float(score_thresh)
         self.nms_thresh = float(nms_thresh)
         self.input_size = tuple(input_size) if input_size else None
+        self.ctx_id = int(ctx_id)
 
     def process(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # NOTE: do NOT pass thresh/threshold here; older builds don’t accept them.
@@ -277,7 +300,14 @@ class UltraFaceDetector(BaseDetector):
         if intra_threads and intra_threads > 0:
             so.intra_op_num_threads = intra_threads
             so.inter_op_num_threads = 1
-        self.sess = ort.InferenceSession(model_path, sess_options=so, providers=["CPUExecutionProvider"])
+        available_providers = ort.get_available_providers()
+        providers: List[str]
+        if "CUDAExecutionProvider" in available_providers:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
+        self.sess = ort.InferenceSession(model_path, sess_options=so, providers=providers)
+        self.providers = providers
 
         self.iname = self.sess.get_inputs()[0].name
         self.score_thresh = float(score_thresh)
@@ -459,6 +489,7 @@ def select_face_detector(
             score_thresh=kwargs.get("score_thresh", 0.3),
             nms_thresh=kwargs.get("nms_thresh", 0.4),
             input_size=kwargs.get("input_size", (416, 416)),  # good CPU default
+            ctx_id=kwargs.get("ctx_id"),
         )
 
     if name in ("ultraface", "ultra-face", "ultralight"):

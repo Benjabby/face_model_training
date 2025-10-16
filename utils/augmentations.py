@@ -259,6 +259,7 @@ class RandomFrameBlackout:
         self._indices: Set[int] = set()
         self._cursor: int = 0
         self._window_size: int = 0
+        self._visibility_floor: float = 1.0
 
     def reset(self, window_size: int, rng: np.random.Generator) -> None:  # pragma: no cover - simple setter
         self._window_size = window_size
@@ -266,7 +267,11 @@ class RandomFrameBlackout:
         if window_size <= 0:
             self._indices = set()
             return
-        max_blackouts = max(0, int(np.floor((1.0 - self.min_mean_visibility) * window_size)))
+        high = np.nextafter(1.0, np.inf)
+        self._visibility_floor = float(
+            rng.uniform(self.min_mean_visibility, high)
+        )
+        max_blackouts = max(0, int(np.floor((1.0 - self._visibility_floor) * window_size)))
         if max_blackouts == 0:
             self._indices = set()
             return
