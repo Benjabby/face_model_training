@@ -72,6 +72,7 @@ class TemporalEncoder(nn.Module):
         ff_hidden_dim: Optional[int] = None,
         dropout: float = 0.1,
         max_seq_len: int = 4096,
+        output_scalar: bool = True,
     ) -> None:
         super().__init__()
         embed_dim = embed_dim or feature_dim
@@ -93,6 +94,7 @@ class TemporalEncoder(nn.Module):
         )
 
         self.num_heads = num_heads
+        self.output_scalar = output_scalar
 
     def _build_attn_mask(self, visibility: Tensor) -> Tensor:
         """Construct a visibility-aware attention mask for all heads."""
@@ -135,4 +137,11 @@ class TemporalEncoder(nn.Module):
             x = layer(x, attn_mask)
 
         heart_rate = self.output_head(x).squeeze(-1)
+
+        if self.output_scalar:
+            weights = visibility.to(dtype=heart_rate.dtype)
+            weights = weights.clamp_min(0.0)
+            denom = weights.sum(dim=1).clamp_min(torch.finfo(heart_rate.dtype).eps)
+            heart_rate = (heart_rate * weights).sum(dim=1) / denom
+
         return heart_rate
