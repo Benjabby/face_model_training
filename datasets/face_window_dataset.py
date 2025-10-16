@@ -539,11 +539,63 @@ class RandomFaceWindowDataset(TorchDataset):
 
     def _apply_post_transforms(
         self, face_rgb: np.ndarray, rng: np.random.Generator
-    ) -> torch.Tensor:
-        transformed = self._apply_transforms(
-            self._post_face_transform_funcs, face_rgb, rng
+    ) -> Tuple[torch.Tensor, float]:
+        data: ArrayLike = face_rgb
+        blackout = False
+
+        for transform in self._post_face_transform_funcs:
+            result = transform(data, rng)
+            if isinstance(result, tuple):
+                if len(result) != 2:
+                    raise ValueError(
+                        "Post-face transforms must return (data, visibility) tuples"
+                    )
+                data, visibility = result
+                if self._coerce_visibility_factor(visibility) <= 0.0:
+                    blackout = True
+            else:
+                data = result
+
+        tensor = self._to_normalized_tensor(data)
+        visibility_scale = 0.0 if blackout else 1.0
+        return tensor, visibility_scale
+
+    def _prepare_context_frame(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[torch.Tensor, Tuple[float, float, float, float, float]]:
+        target_size = self.image_size
+        frame_h, frame_w = frame_bgr.shape[:2]
+        max_dim = max(frame_h, frame_w, 1)
+        scale = float(target_size) / float(max_dim)
+
+        new_w = max(1, int(round(frame_w * scale)))
+        new_h = max(1, int(round(frame_h * scale)))
+
+        interpolation = (
+            cv2.INTER_AREA
+            if frame_h > target_size or frame_w > target_size
+            else cv2.INTER_LINEAR
         )
-        return self._to_normalized_tensor(transformed)
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=interpolation)
+
+        canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        pad_x = max(0, (target_size - new_w) // 2)
+        pad_y = max(0, (target_size - new_h) // 2)
+        canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
+
+        context_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        context_tensor = torch.as_tensor(context_rgb, dtype=torch.float32).permute(2, 0, 1)
+        if context_tensor.max() > 1.0:
+            context_tensor.mul_(1.0 / 255.0)
+
+        transform_info = (
+            scale,
+            float(pad_x),
+            float(pad_y),
+            float(frame_h),
+            float(frame_w),
+        )
+        return context_tensor, transform_info
 
     def _prepare_context_frame(
         self, frame_bgr: np.ndarray
@@ -793,6 +845,21 @@ class RandomFaceWindowDataset(TorchDataset):
         elif not np_array.flags["C_CONTIGUOUS"]:
             np_array = np.ascontiguousarray(np_array)
         return np_array
+
+    @staticmethod
+    def _coerce_visibility_factor(value: object) -> float:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError("Visibility factors must be scalar tensors")
+            return float(value.item())
+
+        if np.isscalar(value):
+            return float(value)  # type: ignore[arg-type]
+
+        array = np.asarray(value)
+        if array.size != 1:
+            raise ValueError("Visibility factors must be scalar values")
+        return float(array.item())
 
     @staticmethod
     def _to_normalized_tensor(face_like: ArrayLike) -> torch.Tensor:
