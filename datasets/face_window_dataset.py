@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset, get_worker_info
 
 from .dataset import CameraData
 from .lgi_ppgi import LGI_PPGI
@@ -86,6 +86,10 @@ class RandomFaceWindowDataset(TorchDataset):
     seed:
         Optional seed forwarded to :func:`numpy.random.default_rng` to
         initialize the dataset's random generator.
+    cache_cameras:
+        When ``True`` (default), keep dataset-specific camera handles open per
+        worker so repeated samples avoid reopening video streams.  Disable to
+        match the previous one-shot behavior.
     """
 
     def __init__(
@@ -103,6 +107,7 @@ class RandomFaceWindowDataset(TorchDataset):
         face_detector: str = "yunet",
         face_detector_kwargs: Optional[Dict[str, object]] = None,
         seed: Optional[int] = None,
+        cache_cameras: bool = True,
     ) -> None:
         super().__init__()
 
@@ -126,6 +131,8 @@ class RandomFaceWindowDataset(TorchDataset):
         self.post_face_transforms = post_face_transforms
         self.seed = seed
         self.rng = np.random.default_rng(seed)
+        self._cache_cameras = cache_cameras
+        self._camera_cache: Dict[Optional[int], Dict[str, CameraData]] = {}
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         detector_kwargs = dict(face_detector_kwargs or {})
@@ -150,6 +157,23 @@ class RandomFaceWindowDataset(TorchDataset):
 
         if not self._videos:
             raise RuntimeError("No usable videos found for the configured datasets")
+
+    def __del__(self) -> None:
+        try:
+            self._close_camera_cache()
+        except Exception:
+            pass
+
+    def __getstate__(self) -> Dict[str, object]:
+        self._close_camera_cache()
+        state = self.__dict__.copy()
+        state["_camera_cache"] = {}
+        return state
+
+    def __setstate__(self, state: Dict[str, object]) -> None:
+        self.__dict__.update(state)
+        if "_camera_cache" not in self.__dict__:
+            self._camera_cache = {}
 
     # ------------------------------------------------------------------
     # PyTorch dataset API
@@ -196,6 +220,48 @@ class RandomFaceWindowDataset(TorchDataset):
     # Internal helpers
     def _get_rng(self) -> np.random.Generator:
         return self.rng
+
+    def _close_camera_cache(self) -> None:
+        cache_dict = getattr(self, "_camera_cache", None)
+        if not cache_dict:
+            return
+        for cache in cache_dict.values():
+            for camera in cache.values():
+                try:
+                    camera.close()
+                except Exception:
+                    continue
+        cache_dict.clear()
+
+    def _worker_cache_key(self) -> Optional[int]:
+        worker_info = get_worker_info()
+        return None if worker_info is None else worker_info.id
+
+    def _get_cached_camera(self, entry: _VideoEntry) -> CameraData:
+        cache_key = self._worker_cache_key()
+        cache = self._camera_cache.setdefault(cache_key, {})
+        camera = cache.get(entry.video_path)
+        if camera is None:
+            camera = CameraData.create(entry.video_path, timestamps=entry.frame_times)
+            cache[entry.video_path] = camera
+        camera.reset()
+        return camera
+
+    def _invalidate_cached_camera(
+        self, entry: _VideoEntry, camera: Optional[CameraData]
+    ) -> None:
+        if camera is None or not self._cache_cameras:
+            return
+        cache_key = self._worker_cache_key()
+        cache = self._camera_cache.get(cache_key)
+        if not cache:
+            return
+        cached = cache.get(entry.video_path)
+        if cached is camera:
+            try:
+                camera.close()
+            finally:
+                cache.pop(entry.video_path, None)
 
     def _prepare_video_entries(self) -> None:
         for name, dataset in self.datasets.items():
@@ -272,13 +338,24 @@ class RandomFaceWindowDataset(TorchDataset):
         rng: np.random.Generator,
         camera: Optional[CameraData] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        owns_camera = camera is None
-        if owns_camera:
-            camera = CameraData.create(entry.video_path, timestamps=entry.frame_times)
+        owns_camera = False
+        cached_camera = False
+        if camera is None:
+            if self._cache_cameras:
+                camera = self._get_cached_camera(entry)
+                cached_camera = True
+            else:
+                camera = CameraData.create(entry.video_path, timestamps=entry.frame_times)
+                owns_camera = True
         assert camera is not None  # For type checkers
 
         try:
-            self._fast_forward_camera(camera, start_frame)
+            try:
+                self._fast_forward_camera(camera, start_frame)
+            except Exception:
+                if cached_camera:
+                    self._invalidate_cached_camera(entry, camera)
+                raise
 
             frames = torch.empty(
                 (self.window_size, 3, self.image_size, self.image_size),
@@ -291,6 +368,8 @@ class RandomFaceWindowDataset(TorchDataset):
                 try:
                     frame_bgr, _ = next(camera)
                 except StopIteration as exc:
+                    if cached_camera:
+                        self._invalidate_cached_camera(entry, camera)
                     raise RuntimeError(
                         f"Failed to read frame {start_frame + frame_idx} from '{entry.video_path}'"
                     ) from exc
@@ -634,6 +713,9 @@ def create_face_window_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         drop_last=drop_last,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        **({"prefetch_factor": 4} if num_workers > 0 else {}),
     )
     return loader, dataset
 

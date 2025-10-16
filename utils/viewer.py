@@ -9,13 +9,6 @@ import torch
 from ..datasets.face_window_dataset import RandomFaceWindowDataset
 
 
-def _find_video_entry(dataset: RandomFaceWindowDataset, name: str, index: int):
-    for entry in dataset._videos:  # type: ignore[attr-defined]
-        if entry.dataset_name == name and entry.dataset_index == index:
-            return entry
-    raise ValueError(f"Unable to locate video entry for {name}[{index}]")
-
-
 def _tensor_to_bgr(frame_tensor: torch.Tensor) -> np.ndarray:
     frame = frame_tensor.detach().cpu().numpy()
     frame = np.clip(frame, 0.0, 1.0)
@@ -25,7 +18,7 @@ def _tensor_to_bgr(frame_tensor: torch.Tensor) -> np.ndarray:
 
 
 def show(dataset: RandomFaceWindowDataset, batch_number: int = 0, delay: int = 30) -> None:
-    """Display a dataset window using OpenCV windows."""
+    """Display a dataset window using the cached face tensors."""
 
     sample = dataset[batch_number]
     frames: torch.Tensor = sample["frames"]  # type: ignore[assignment]
@@ -34,64 +27,63 @@ def show(dataset: RandomFaceWindowDataset, batch_number: int = 0, delay: int = 3
     video_index: int = sample["video_index"]  # type: ignore[assignment]
     start_frame: int = sample["start_frame"]  # type: ignore[assignment]
 
-    entry = _find_video_entry(dataset, dataset_name, video_index)
-    capture = cv2.VideoCapture(entry.video_path)
-    if start_frame > 0:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    num_frames = int(frames.shape[0])
+    for frame_idx in range(num_frames):
+        face_tensor = frames[frame_idx]
+        if face_tensor.ndim != 3:
+            raise ValueError("Frame tensors must be 3-dimensional (C, H, W)")
+        if face_tensor.shape[0] < 3:
+            raise ValueError("Frame tensors must contain at least three channels")
 
-    try:
-        for frame_idx in range(frames.shape[0]):
-            success, full_frame = capture.read()
-            if not success:
-                break
+        face = _tensor_to_bgr(face_tensor[0:3])
+        vis = float(metadata[frame_idx, 0].item())
+        cx = float(metadata[frame_idx, 1].item())
+        cy = float(metadata[frame_idx, 2].item())
+        width = float(metadata[frame_idx, 3].item())
+        height = float(metadata[frame_idx, 4].item())
 
-            visibility = float(metadata[frame_idx, 0].item())
-            max_dim = float(max(full_frame.shape[0], full_frame.shape[1]))
-            width = float(metadata[frame_idx, 3].item()) * max_dim
-            height = float(metadata[frame_idx, 4].item()) * max_dim
-            cx = float(metadata[frame_idx, 1].item()) * max_dim
-            cy = float(metadata[frame_idx, 2].item()) * max_dim
-            x0 = int(round(cx - width / 2.0))
-            y0 = int(round(cy - height / 2.0))
-            x1 = int(round(cx + width / 2.0))
-            y1 = int(round(cy + height / 2.0))
+        overlay = face.copy()
+        h, w = overlay.shape[:2]
+        center = (int(round(cx * w)), int(round(cy * h)))
+        box_w = max(1, int(round(width * w)))
+        box_h = max(1, int(round(height * h)))
+        x0 = max(0, center[0] - box_w // 2)
+        y0 = max(0, center[1] - box_h // 2)
+        x1 = min(w - 1, center[0] + box_w // 2)
+        y1 = min(h - 1, center[1] + box_h // 2)
 
-            h, w = full_frame.shape[:2]
-            x0_clamped = max(0, min(w - 1, x0))
-            y0_clamped = max(0, min(h - 1, y0))
-            x1_clamped = max(0, min(w - 1, x1))
-            y1_clamped = max(0, min(h - 1, y1))
+        color = (0, 255, 0) if vis > 0.0 else (0, 0, 255)
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 1)
 
-            if visibility > 0.0:
-                color = (0, 255, 0)
-            else:
-                color = (0, 0, 255)
-            cv2.rectangle(full_frame, (x0_clamped, y0_clamped), (x1_clamped, y1_clamped), color, 2)
+        info_lines = [
+            f"dataset: {dataset_name}",
+            f"video: {video_index}",
+            f"frame: {start_frame + frame_idx}",
+            f"visibility: {vis:.2f}",
+            f"center: ({cx:.3f}, {cy:.3f})",
+            f"size: ({width:.3f}, {height:.3f})",
+        ]
 
-            text = f"vis: {visibility:.2f}"
-            text_origin = (x0_clamped, max(20, y0_clamped - 10))
+        y_cursor = 18
+        for line in info_lines:
             cv2.putText(
-                full_frame,
-                text,
-                text_origin,
+                overlay,
+                line,
+                (8, y_cursor),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.5,
                 color,
-                2,
+                1,
                 cv2.LINE_AA,
             )
+            y_cursor += 18
 
-            face = _tensor_to_bgr(frames[frame_idx, 0:3])
+        cv2.imshow("RandomFaceWindowDataset - Face", overlay)
+        key = cv2.waitKey(delay)
+        if key in (27, ord("q")):
+            break
 
-            cv2.imshow("RandomFaceWindowDataset - Full", full_frame)
-            cv2.imshow("RandomFaceWindowDataset - Face", face)
-            key = cv2.waitKey(delay)
-            if key in (27, ord("q")):
-                break
-    finally:
-        capture.release()
-        cv2.destroyWindow("RandomFaceWindowDataset - Full")
-        cv2.destroyWindow("RandomFaceWindowDataset - Face")
+    cv2.destroyWindow("RandomFaceWindowDataset - Face")
 
 
 __all__ = ["show"]

@@ -108,6 +108,11 @@ class CameraData(metaclass=ABCMeta):
         pass
 
     @abstractmethod
+    def reset(self):
+        """Return the stream to the first frame."""
+        pass
+
+    @abstractmethod
     def skip(self, frames_to_skip):
         """Advance the stream by ``frames_to_skip`` frames without decoding them."""
         pass

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Callable, Dict, Optional
 
 import torch
@@ -7,6 +8,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 
 from ..datasets.face_window_dataset import RandomFaceWindowDataset
 from ..models import Combined
@@ -43,13 +45,17 @@ def _make_dataloader(
     pin_memory: Optional[bool],
 ) -> DataLoader:
     use_pin_memory = pin_memory if pin_memory is not None else torch.cuda.is_available()
-    return DataLoader(
-        dataset,
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=use_pin_memory,
     )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+    return DataLoader(**loader_kwargs)
 
 
 def train_one_epoch(
@@ -58,21 +64,34 @@ def train_one_epoch(
     optimizer: Optimizer,
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
+    *,
+    amp_enabled: bool = False,
+    scaler: Optional[GradScaler] = None,
 ) -> float:
     model.train()
     running_loss = 0.0
     batches = 0
+    use_amp = amp_enabled and device.type == "cuda"
+    scaler = scaler or GradScaler(enabled=use_amp)
+    autocast_cm = autocast if use_amp else nullcontext
 
     for batch in dataloader:
-        frames = batch["frames"].to(device)
-        metadata = batch["face_metadata"].to(device)
-        targets = batch["heart_rates"].to(device)
+        frames = batch["frames"].to(device, non_blocking=use_amp)
+        metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
+        targets = batch["heart_rates"].to(device, non_blocking=use_amp)
 
         optimizer.zero_grad(set_to_none=True)
-        predictions, _, visibility = model(frames, metadata)
-        loss = loss_fn(predictions, targets, visibility.to(device))
-        loss.backward()
-        optimizer.step()
+        with autocast_cm():
+            predictions, _, visibility = model(frames, metadata)
+            loss = loss_fn(predictions, targets, visibility)
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         running_loss += loss.item()
         batches += 1
@@ -85,19 +104,24 @@ def evaluate(
     dataloader: DataLoader,
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
+    *,
+    amp_enabled: bool = False,
 ) -> float:
     model.eval()
     running_loss = 0.0
     batches = 0
+    use_amp = amp_enabled and device.type == "cuda"
+    autocast_cm = autocast if use_amp else nullcontext
 
     with torch.no_grad():
         for batch in dataloader:
-            frames = batch["frames"].to(device)
-            metadata = batch["face_metadata"].to(device)
-            targets = batch["heart_rates"].to(device)
+            frames = batch["frames"].to(device, non_blocking=use_amp)
+            metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
+            targets = batch["heart_rates"].to(device, non_blocking=use_amp)
 
-            predictions, _, visibility = model(frames, metadata)
-            loss = loss_fn(predictions, targets, visibility.to(device))
+            with autocast_cm():
+                predictions, _, visibility = model(frames, metadata)
+                loss = loss_fn(predictions, targets, visibility)
 
             running_loss += loss.item()
             batches += 1
@@ -121,6 +145,8 @@ def train(
     scheduler: Optional[_LRScheduler] = None,
     loss_fn: Optional[Callable[[Tensor, Tensor, Tensor], Tensor]] = None,
     device: Optional[torch.device] = None,
+    use_amp: Optional[bool] = None,
+    grad_scaler: Optional[GradScaler] = None,
 ) -> Dict[str, list]:
     """Train a combined model using :class:`RandomFaceWindowDataset` samples."""
 
@@ -130,12 +156,27 @@ def train(
         val_dataset = RandomFaceWindowDataset(**val_dataset_kwargs)
 
     resolved_device = _resolve_device(device)
+    amp_enabled = bool(use_amp) if use_amp is not None else resolved_device.type == "cuda"
+    amp_enabled = amp_enabled and resolved_device.type == "cuda"
+    if resolved_device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        cuda_backends = getattr(torch.backends, "cuda", None)
+        if cuda_backends is not None:
+            matmul_backend = getattr(cuda_backends, "matmul", None)
+            if matmul_backend is not None and hasattr(matmul_backend, "allow_tf32"):
+                matmul_backend.allow_tf32 = True  # type: ignore[attr-defined]
+        cudnn_backend = getattr(torch.backends, "cudnn", None)
+        if cudnn_backend is not None and hasattr(cudnn_backend, "allow_tf32"):
+            cudnn_backend.allow_tf32 = True  # type: ignore[attr-defined]
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("medium")
 
     model = model or Combined()
     model.to(resolved_device)
 
     optimizer = optimizer or torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_fn = loss_fn or masked_mse_loss
+    scaler = grad_scaler or GradScaler(enabled=amp_enabled)
 
     train_loader = _make_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
@@ -151,11 +192,25 @@ def train(
         history["val_loss"] = []
 
     for _ in range(epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, resolved_device)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            loss_fn,
+            resolved_device,
+            amp_enabled=amp_enabled,
+            scaler=scaler,
+        )
         history["train_loss"].append(train_loss)
 
         if val_loader is not None:
-            val_loss = evaluate(model, val_loader, loss_fn, resolved_device)
+            val_loss = evaluate(
+                model,
+                val_loader,
+                loss_fn,
+                resolved_device,
+                amp_enabled=amp_enabled,
+            )
             history["val_loss"].append(val_loss)
 
         if scheduler is not None:
