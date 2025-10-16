@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from time import perf_counter
 from typing import Callable, Dict, Optional
 
 import torch
@@ -8,10 +9,24 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from tqdm.auto import tqdm
+from torch.profiler import ProfilerActivity, profile as torch_profile
 
 from ..datasets.face_window_dataset import RandomFaceWindowDataset
 from ..models import Combined
+
+
+_amp_module = getattr(torch, "amp", None)
+if _amp_module is not None and hasattr(_amp_module, "GradScaler"):
+    from torch.amp import GradScaler  # type: ignore[attr-defined]
+    from torch.amp import autocast as _autocast  # type: ignore[attr-defined]
+
+    _AMP_REQUIRES_DEVICE_TYPE = True
+else:  # pragma: no cover - fallback for older PyTorch versions
+    from torch.cuda.amp import GradScaler  # type: ignore
+    from torch.cuda.amp import autocast as _autocast  # type: ignore
+
+    _AMP_REQUIRES_DEVICE_TYPE = False
 
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, visibility: Tensor) -> Tensor:
@@ -72,8 +87,7 @@ def train_one_epoch(
     running_loss = 0.0
     batches = 0
     use_amp = amp_enabled and device.type == "cuda"
-    scaler = scaler or GradScaler(enabled=use_amp)
-    autocast_cm = autocast if use_amp else nullcontext
+    scaler = scaler or _create_grad_scaler(use_amp)
 
     for batch in dataloader:
         frames = batch["frames"].to(device, non_blocking=use_amp)
@@ -81,7 +95,7 @@ def train_one_epoch(
         targets = batch["heart_rates"].to(device, non_blocking=use_amp)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast_cm():
+        with _autocast_context(device, use_amp):
             predictions, _, visibility = model(frames, metadata)
             loss = loss_fn(predictions, targets, visibility)
 
@@ -111,7 +125,6 @@ def evaluate(
     running_loss = 0.0
     batches = 0
     use_amp = amp_enabled and device.type == "cuda"
-    autocast_cm = autocast if use_amp else nullcontext
 
     with torch.no_grad():
         for batch in dataloader:
@@ -119,7 +132,7 @@ def evaluate(
             metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
             targets = batch["heart_rates"].to(device, non_blocking=use_amp)
 
-            with autocast_cm():
+            with _autocast_context(device, use_amp):
                 predictions, _, visibility = model(frames, metadata)
                 loss = loss_fn(predictions, targets, visibility)
 
@@ -147,6 +160,7 @@ def train(
     device: Optional[torch.device] = None,
     use_amp: Optional[bool] = None,
     grad_scaler: Optional[GradScaler] = None,
+    profile_epoch: bool = False,
 ) -> Dict[str, list]:
     """Train a combined model using :class:`RandomFaceWindowDataset` samples."""
 
@@ -176,7 +190,7 @@ def train(
 
     optimizer = optimizer or torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_fn = loss_fn or masked_mse_loss
-    scaler = grad_scaler or GradScaler(enabled=amp_enabled)
+    scaler = grad_scaler or _create_grad_scaler(amp_enabled)
 
     train_loader = _make_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
@@ -191,16 +205,31 @@ def train(
     if val_loader is not None:
         history["val_loss"] = []
 
-    for _ in range(epochs):
-        train_loss = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            loss_fn,
-            resolved_device,
-            amp_enabled=amp_enabled,
-            scaler=scaler,
-        )
+    progress_bar = tqdm(range(1, epochs + 1), desc="Training", unit="epoch")
+    for epoch_idx in progress_bar:
+        if profile_epoch and epoch_idx == 1:
+            train_loss, profiler_lines, profiler_table = _profile_train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                loss_fn,
+                resolved_device,
+                amp_enabled=amp_enabled,
+                scaler=scaler,
+            )
+            for line in profiler_lines:
+                tqdm.write(line)
+            tqdm.write(profiler_table)
+        else:
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                loss_fn,
+                resolved_device,
+                amp_enabled=amp_enabled,
+                scaler=scaler,
+            )
         history["train_loss"].append(train_loss)
 
         if val_loader is not None:
@@ -212,11 +241,90 @@ def train(
                 amp_enabled=amp_enabled,
             )
             history["val_loss"].append(val_loss)
+            progress_bar.set_postfix({"train_loss": f"{train_loss:.4f}", "val_loss": f"{val_loss:.4f}"})
+        else:
+            progress_bar.set_postfix({"train_loss": f"{train_loss:.4f}"})
 
         if scheduler is not None:
             scheduler.step()
 
     return history
+
+
+def _create_grad_scaler(enabled: bool) -> GradScaler:
+    kwargs = {"enabled": enabled}
+    if _AMP_REQUIRES_DEVICE_TYPE:
+        kwargs["device_type"] = "cuda"
+
+    try:
+        return GradScaler(**kwargs)
+    except TypeError as exc:
+        if "device_type" not in kwargs:
+            raise
+        # Older torch.amp versions expose GradScaler but do not accept the
+        # device_type argument. Retry without it so training still works.
+        kwargs = dict(kwargs)
+        kwargs.pop("device_type", None)
+        try:
+            return GradScaler(**kwargs)
+        except TypeError:
+            raise exc
+
+
+def _autocast_context(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if _AMP_REQUIRES_DEVICE_TYPE:
+        return _autocast(device_type=device.type)
+    return _autocast()
+
+
+def _profile_train_epoch(
+    model: Combined,
+    dataloader: DataLoader,
+    optimizer: Optimizer,
+    loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
+    device: torch.device,
+    *,
+    amp_enabled: bool,
+    scaler: GradScaler,
+) -> tuple[float, list[str], str]:
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda" and torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    start_time = perf_counter()
+    with torch_profile(activities=activities, record_shapes=False, profile_memory=False) as profiler:
+        loss = train_one_epoch(
+            model,
+            dataloader,
+            optimizer,
+            loss_fn,
+            device,
+            amp_enabled=amp_enabled,
+            scaler=scaler,
+        )
+    duration = perf_counter() - start_time
+
+    summary = profiler.key_averages().total_average()
+    cpu_time_ms = getattr(summary, "cpu_time_total", 0.0)
+    cuda_time_ms = getattr(summary, "cuda_time_total", 0.0)
+
+    info_lines = [f"Profiled epoch duration: {duration:.3f}s", f"CPU time (profiler): {cpu_time_ms / 1000.0:.3f}s"]
+    if cuda_time_ms:
+        info_lines.append(f"CUDA time (profiler): {cuda_time_ms / 1000.0:.3f}s")
+
+    num_batches = len(dataloader) if hasattr(dataloader, "__len__") else None
+    batch_size = getattr(dataloader, "batch_size", None)
+    if num_batches and duration > 0:
+        info_lines.append(f"Batches/sec: {num_batches / duration:.2f}")
+        if batch_size:
+            info_lines.append(f"Approx. samples/sec: {(num_batches * batch_size) / duration:.2f}")
+
+    sort_by = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
+    profiler_table = profiler.key_averages().table(sort_by=sort_by, row_limit=10)
+
+    return loss, info_lines, profiler_table
 
 
 __all__ = [
