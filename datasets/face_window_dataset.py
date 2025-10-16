@@ -196,19 +196,9 @@ class RandomFaceWindowDataset(TorchDataset):
     def get_window_with_context(
         self, index: int = 0
     ) -> Dict[str, Union[str, int, torch.Tensor]]:
-        """Return a sampled window that preserves context frames.
+        """Return a randomly sampled window that preserves context frames."""
 
-        Parameters
-        ----------
-        index:
-            Optional deterministic index used to seed a temporary random
-            generator.  Reusing the same index will yield the same sampled
-            window when the dataset was initialized with a fixed seed.  The
-            dataset's main random generator remains unaffected.
-        """
-
-        rng = self._spawn_index_rng(index)
-        return self._sample_window(include_context=True, rng=rng)
+        return self._sample_window(include_context=True)
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -230,17 +220,6 @@ class RandomFaceWindowDataset(TorchDataset):
     def _get_rng(self) -> np.random.Generator:
         return self.rng
 
-    def _spawn_index_rng(self, index: int) -> np.random.Generator:
-        if index < 0:
-            raise ValueError("index must be non-negative")
-
-        if self.seed is not None:
-            seed_seq = np.random.SeedSequence(self.seed, spawn_key=(int(index),))
-        else:
-            seed_seq = np.random.SeedSequence(int(index))
-
-        return np.random.default_rng(seed_seq)
-
     def _sample_window(
         self,
         *,
@@ -250,7 +229,12 @@ class RandomFaceWindowDataset(TorchDataset):
         active_rng = self._get_rng() if rng is None else rng
         entry, start_frame = self._select_entry_and_start(active_rng)
         self._reset_transform_state(active_rng)
-        frames, face_metadata, context_frames = self._read_face_window(
+        (
+            frames,
+            face_metadata,
+            context_frames,
+            context_transforms,
+        ) = self._read_face_window(
             entry,
             start_frame,
             active_rng,
@@ -266,8 +250,9 @@ class RandomFaceWindowDataset(TorchDataset):
             "heart_rates": heart_rates,
         }
         if include_context:
-            assert context_frames is not None
+            assert context_frames is not None and context_transforms is not None
             sample["context_frames"] = context_frames
+            sample["context_transforms"] = context_transforms
         return sample
 
     def _select_entry_and_start(
@@ -482,7 +467,15 @@ class RandomFaceWindowDataset(TorchDataset):
                 dtype=torch.float32,
             )
             metadata = torch.zeros((self.window_size, 5), dtype=torch.float32)
-            context_frames_list: List[torch.Tensor] = []
+            if include_context:
+                context_frames = torch.empty(
+                    (self.window_size, 3, self.image_size, self.image_size),
+                    dtype=torch.float32,
+                )
+                context_transforms = torch.zeros((self.window_size, 5), dtype=torch.float32)
+            else:
+                context_frames = None
+                context_transforms = None
             last_bbox: Optional[Tuple[int, int, int, int]] = None
 
             for frame_idx in range(self.window_size):
@@ -500,29 +493,23 @@ class RandomFaceWindowDataset(TorchDataset):
                 bbox, visibility = self._detect_face(frame_bgr, last_bbox)
                 face_rgb, adjusted_bbox = self._extract_face(frame_bgr, bbox)
                 last_bbox = adjusted_bbox
-                face_tensor, post_visibility = self._apply_post_transforms(
-                    face_rgb, rng
-                )
+                face_tensor = self._apply_post_transforms(face_rgb, rng)
                 face_frames[frame_idx].copy_(face_tensor)
                 if include_context:
-                    context_frames_list.append(self._prepare_context_frame(frame_bgr))
-                combined_visibility = visibility * post_visibility
-                metadata[frame_idx].copy_(
-                    self._build_face_metadata(
-                        adjusted_bbox,
-                        combined_visibility,
-                        frame_bgr.shape,
+                    (
+                        context_tensor,
+                        transform_info,
+                    ) = self._prepare_context_frame(frame_bgr)
+                    assert context_frames is not None and context_transforms is not None
+                    context_frames[frame_idx].copy_(context_tensor)
+                    context_transforms[frame_idx].copy_(
+                        torch.as_tensor(transform_info, dtype=torch.float32)
                     )
+                metadata[frame_idx].copy_(
+                    self._build_face_metadata(adjusted_bbox, visibility, frame_bgr.shape)
                 )
 
-            if include_context:
-                if not context_frames_list:
-                    raise RuntimeError("Context frames were requested but none were captured")
-                context_frames = torch.stack(context_frames_list, dim=0)
-            else:
-                context_frames = None
-
-            return face_frames, metadata, context_frames
+            return face_frames, metadata, context_frames, context_transforms
         finally:
             if owns_camera:
                 camera.close()
@@ -573,12 +560,79 @@ class RandomFaceWindowDataset(TorchDataset):
         visibility_scale = 0.0 if blackout else 1.0
         return tensor, visibility_scale
 
-    def _prepare_context_frame(self, frame_bgr: np.ndarray) -> torch.Tensor:
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        context_tensor = torch.as_tensor(frame_rgb, dtype=torch.float32).permute(2, 0, 1)
+    def _prepare_context_frame(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[torch.Tensor, Tuple[float, float, float, float, float]]:
+        target_size = self.image_size
+        frame_h, frame_w = frame_bgr.shape[:2]
+        max_dim = max(frame_h, frame_w, 1)
+        scale = float(target_size) / float(max_dim)
+
+        new_w = max(1, int(round(frame_w * scale)))
+        new_h = max(1, int(round(frame_h * scale)))
+
+        interpolation = (
+            cv2.INTER_AREA
+            if frame_h > target_size or frame_w > target_size
+            else cv2.INTER_LINEAR
+        )
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=interpolation)
+
+        canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        pad_x = max(0, (target_size - new_w) // 2)
+        pad_y = max(0, (target_size - new_h) // 2)
+        canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
+
+        context_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        context_tensor = torch.as_tensor(context_rgb, dtype=torch.float32).permute(2, 0, 1)
         if context_tensor.max() > 1.0:
             context_tensor.mul_(1.0 / 255.0)
-        return context_tensor
+
+        transform_info = (
+            scale,
+            float(pad_x),
+            float(pad_y),
+            float(frame_h),
+            float(frame_w),
+        )
+        return context_tensor, transform_info
+
+    def _prepare_context_frame(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[torch.Tensor, Tuple[float, float, float, float, float]]:
+        target_size = self.image_size
+        frame_h, frame_w = frame_bgr.shape[:2]
+        max_dim = max(frame_h, frame_w, 1)
+        scale = float(target_size) / float(max_dim)
+
+        new_w = max(1, int(round(frame_w * scale)))
+        new_h = max(1, int(round(frame_h * scale)))
+
+        interpolation = (
+            cv2.INTER_AREA
+            if frame_h > target_size or frame_w > target_size
+            else cv2.INTER_LINEAR
+        )
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=interpolation)
+
+        canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        pad_x = max(0, (target_size - new_w) // 2)
+        pad_y = max(0, (target_size - new_h) // 2)
+        canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
+
+        context_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        context_tensor = torch.as_tensor(context_rgb, dtype=torch.float32).permute(2, 0, 1)
+        if context_tensor.max() > 1.0:
+            context_tensor.mul_(1.0 / 255.0)
+
+        transform_info = (
+            scale,
+            float(pad_x),
+            float(pad_y),
+            float(frame_h),
+            float(frame_w),
+        )
+        return context_tensor, transform_info
 
     def _apply_transforms(
         self,
