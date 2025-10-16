@@ -95,6 +95,12 @@ class RandomFaceWindowDataset(TorchDataset):
     heart_rate_as_scalar:
         When ``True`` (default), return the mean heart rate for each sampled
         window as a scalar tensor instead of the full per-frame signal.
+    batch_size:
+        Default number of windows returned by :meth:`get_batch`.
+    num_processes:
+        Optional number of worker processes used by :meth:`get_batch`.  When
+        ``None`` (default) the worker count is derived from
+        :func:`os.cpu_count` and the configured batch size.
     seed:
         Optional seed forwarded to :func:`numpy.random.default_rng` to
         initialize the dataset's random generator.
@@ -119,6 +125,8 @@ class RandomFaceWindowDataset(TorchDataset):
         face_detector: str = "yunet",
         face_detector_kwargs: Optional[Dict[str, object]] = None,
         heart_rate_as_scalar: bool = True,
+        batch_size: int = 1,
+        num_processes: Optional[int] = None,
         seed: Optional[int] = None,
         cache_cameras: bool = True,
     ) -> None:
@@ -128,10 +136,16 @@ class RandomFaceWindowDataset(TorchDataset):
             raise ValueError("window_size must be positive")
         if image_size <= 0:
             raise ValueError("image_size must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if num_processes is not None and int(num_processes) < 0:
+            raise ValueError("num_processes must be non-negative")
 
         self.window_size = window_size
         self.image_size = image_size
         self._epoch_size = epoch_size
+        self._batch_size = int(batch_size)
+        self._num_processes: Optional[int] = None if num_processes is None else int(num_processes)
         self._pre_face_transforms: Tuple[Callable[[ArrayLike], ArrayLike], ...] = ()
         self._post_face_transforms: Tuple[Callable[[ArrayLike], ArrayLike], ...] = ()
         self._pre_face_transform_funcs: Tuple[
@@ -295,10 +309,8 @@ class RandomFaceWindowDataset(TorchDataset):
 
     def get_batch(
         self,
-        batch_size: int,
         *,
         include_context: bool = False,
-        num_processes: Optional[int] = None,
         dataset_name: Optional[str] = None,
         video_index: Optional[int] = None,
     ) -> Dict[str, object]:
@@ -306,27 +318,23 @@ class RandomFaceWindowDataset(TorchDataset):
 
         Parameters
         ----------
-        batch_size:
-            Number of windows to collect for the returned batch.
         include_context:
             When ``True`` include the per-frame context imagery in each sample.
-        num_processes:
-            Optional override for the number of worker processes used to sample
-            the batch.  When omitted the value defaults to the smaller of
-            ``batch_size`` and :func:`os.cpu_count`.
         dataset_name, video_index:
             Optional selectors forwarded to :meth:`_sample_window` to restrict
             sampling to a particular dataset or video.
         """
 
+        batch_size = self._batch_size
         if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
+            raise RuntimeError("Configured batch_size must be positive to sample a batch")
 
-        if num_processes is None:
+        configured_processes = self._num_processes
+        if configured_processes is None:
             cpu_count = os.cpu_count() or 1
             process_count = min(batch_size, cpu_count)
         else:
-            process_count = max(1, min(batch_size, int(num_processes)))
+            process_count = max(1, min(batch_size, int(configured_processes)))
 
         if process_count <= 1:
             samples = [
@@ -377,6 +385,28 @@ class RandomFaceWindowDataset(TorchDataset):
     @property
     def available_datasets(self) -> Sequence[str]:
         return tuple(self.datasets.keys())
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    def set_batch_size(self, batch_size: int) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self._batch_size = int(batch_size)
+
+    @property
+    def num_processes(self) -> Optional[int]:
+        return self._num_processes
+
+    def set_num_processes(self, num_processes: Optional[int]) -> None:
+        if num_processes is None:
+            self._num_processes = None
+            return
+        value = int(num_processes)
+        if value < 0:
+            raise ValueError("num_processes must be non-negative")
+        self._num_processes = value
 
     def train_test_split(
         self,
