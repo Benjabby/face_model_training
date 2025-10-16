@@ -14,7 +14,9 @@ class Combined(nn.Module):
     The combined model first processes frames with :class:`FrameEncoder` to
     obtain per-frame embeddings and visibility scores, and then feeds the
     resulting sequence into :class:`TemporalEncoder` to predict a heart-rate
-    signal.
+    signal.  By default, the temporal encoder is configured to emit a scalar
+    mean heart rate per sample; disable ``return_scalar_heart_rate`` to recover
+    the full temporal signal.
     """
 
     def __init__(
@@ -22,12 +24,22 @@ class Combined(nn.Module):
         *,
         frame_encoder: Optional[FrameEncoder] = None,
         temporal_encoder: Optional[TemporalEncoder] = None,
+        return_scalar_heart_rate: bool = True,
     ) -> None:
         super().__init__()
         self.frame_encoder = frame_encoder or FrameEncoder()
-        self.temporal_encoder = temporal_encoder or TemporalEncoder(
-            feature_dim=self.frame_encoder.embed_dim
-        )
+        self.return_scalar_heart_rate = return_scalar_heart_rate
+
+        if temporal_encoder is None:
+            temporal_encoder = TemporalEncoder(
+                feature_dim=self.frame_encoder.embed_dim,
+                output_scalar=self.return_scalar_heart_rate,
+            )
+        else:
+            if hasattr(temporal_encoder, "output_scalar"):
+                temporal_encoder.output_scalar = self.return_scalar_heart_rate
+
+        self.temporal_encoder = temporal_encoder
 
     def forward(self, frames: Tensor, metadata: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Run the spatial encoder followed by the temporal encoder.
@@ -40,7 +52,9 @@ class Combined(nn.Module):
 
         Returns:
             A tuple ``(predictions, features, visibility)`` where ``predictions``
-            contains the heart-rate signal estimated by the temporal encoder,
+            contains the heart-rate estimate produced by the temporal encoder
+            with shape ``[B]`` when ``return_scalar_heart_rate`` is ``True`` and
+            ``[B, S]`` otherwise,
             ``features`` contains the per-frame embeddings produced by the frame
             encoder, and ``visibility`` provides the visibility weights used for
             temporal attention.
@@ -57,6 +71,9 @@ class Combined(nn.Module):
             visibility = visibility.unsqueeze(0)
 
         predictions = self.temporal_encoder(features, visibility)
+
+        if self.return_scalar_heart_rate and predictions.dim() > 1:
+            predictions = predictions.mean(dim=-1)
 
         if squeeze_batch:
             predictions = predictions.squeeze(0)
