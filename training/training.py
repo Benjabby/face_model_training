@@ -32,10 +32,8 @@ else:  # pragma: no cover - fallback for older PyTorch versions
 def masked_mse_loss(predictions: Tensor, targets: Tensor, visibility: Tensor) -> Tensor:
     """Compute a visibility-weighted mean squared error."""
 
-    if predictions.shape == targets.shape:
+    if predictions.shape == targets.shape and visibility.shape == predictions.shape:
         weights = visibility.to(dtype=predictions.dtype)
-        if weights.shape != predictions.shape:
-            raise ValueError("visibility must align with predictions for masking")
 
         squared_error = (predictions - targets) ** 2
         clamped_weights = weights.clamp_min(0.0)
