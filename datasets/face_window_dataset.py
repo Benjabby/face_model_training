@@ -266,9 +266,17 @@ class RandomFaceWindowDataset(TorchDataset):
         return torch.as_tensor(heart_rates, dtype=torch.float32)
 
     def _read_face_window(
-        self, entry: _VideoEntry, start_frame: int, rng: np.random.Generator
+        self,
+        entry: _VideoEntry,
+        start_frame: int,
+        rng: np.random.Generator,
+        camera: Optional[CameraData] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        capture = cv2.VideoCapture(entry.video_path)
+        owns_camera = camera is None
+        if owns_camera:
+            camera = CameraData.create(entry.video_path, timestamps=entry.frame_times)
+        assert camera is not None  # For type checkers
+
         try:
             self._fast_forward_camera(camera, start_frame)
 
@@ -300,7 +308,8 @@ class RandomFaceWindowDataset(TorchDataset):
 
             return frames, metadata
         finally:
-            camera.close()
+            if owns_camera:
+                camera.close()
 
     def _fast_forward_camera(self, camera: CameraData, frames_to_skip: int) -> None:
         if frames_to_skip <= 0:
