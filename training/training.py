@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import inspect
 from time import perf_counter
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import Tensor
@@ -225,7 +226,7 @@ def train(
     progress_bar = tqdm(range(1, epochs + 1), desc="Training", unit="epoch")
     for epoch_idx in progress_bar:
         if profile_epoch and epoch_idx == 1:
-            train_loss, profiler_lines, profiler_table = _profile_train_epoch(
+            train_loss, profiler_lines, profiler_tables = _profile_train_epoch(
                 model,
                 train_loader,
                 optimizer,
@@ -236,7 +237,8 @@ def train(
             )
             for line in profiler_lines:
                 tqdm.write(line)
-            tqdm.write(profiler_table)
+            for table in profiler_tables:
+                tqdm.write(table)
         else:
             train_loss = train_one_epoch(
                 model,
@@ -305,22 +307,72 @@ def _profile_train_epoch(
     *,
     amp_enabled: bool,
     scaler: GradScaler,
-) -> tuple[float, list[str], str]:
+) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda" and torch.cuda.is_available():
         activities.append(ProfilerActivity.CUDA)
 
+    profile_kwargs = dict(activities=activities, record_shapes=True, profile_memory=False)
+    profiler_supports_stack = False
+    if "with_stack" in inspect.signature(torch_profile).parameters:
+        profile_kwargs["with_stack"] = True
+        profiler_supports_stack = True
+
+    model.train()
+    use_amp = amp_enabled and device.type == "cuda"
+    stage_totals = {
+        "data_wait": 0.0,
+        "h2d_transfer": 0.0,
+        "forward": 0.0,
+        "backward": 0.0,
+        "optimizer": 0.0,
+    }
+
     start_time = perf_counter()
-    with torch_profile(activities=activities, record_shapes=False, profile_memory=False) as profiler:
-        loss = train_one_epoch(
-            model,
-            dataloader,
-            optimizer,
-            loss_fn,
-            device,
-            amp_enabled=amp_enabled,
-            scaler=scaler,
-        )
+    with torch_profile(**profile_kwargs) as profiler:
+        running_loss = 0.0
+        batches = 0
+        batch_wait_start = perf_counter()
+
+        for batch in dataloader:
+            stage_totals["data_wait"] += perf_counter() - batch_wait_start
+
+            transfer_start = perf_counter()
+            frames = batch["frames"].to(device, non_blocking=use_amp)
+            metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
+            targets = batch["heart_rates"].to(device, non_blocking=use_amp)
+            stage_totals["h2d_transfer"] += perf_counter() - transfer_start
+
+            optimizer.zero_grad(set_to_none=True)
+
+            forward_start = perf_counter()
+            with _autocast_context(device, use_amp):
+                predictions, _, visibility = model(frames, metadata)
+                loss = loss_fn(predictions, targets, visibility)
+            stage_totals["forward"] += perf_counter() - forward_start
+
+            backward_start = perf_counter()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                stage_totals["backward"] += perf_counter() - backward_start
+
+                optimizer_start = perf_counter()
+                scaler.step(optimizer)
+                stage_totals["optimizer"] += perf_counter() - optimizer_start
+                scaler.update()
+            else:
+                loss.backward()
+                stage_totals["backward"] += perf_counter() - backward_start
+
+                optimizer_start = perf_counter()
+                optimizer.step()
+                stage_totals["optimizer"] += perf_counter() - optimizer_start
+
+            running_loss += loss.item()
+            batches += 1
+            batch_wait_start = perf_counter()
+
+        loss = running_loss / max(batches, 1)
     duration = perf_counter() - start_time
 
     summary = profiler.key_averages().total_average()
@@ -333,15 +385,43 @@ def _profile_train_epoch(
 
     num_batches = len(dataloader) if hasattr(dataloader, "__len__") else None
     batch_size = getattr(dataloader, "batch_size", None)
-    if num_batches and duration > 0:
+
+    if duration > 0 and num_batches:
         info_lines.append(f"Batches/sec: {num_batches / duration:.2f}")
         if batch_size:
             info_lines.append(f"Approx. samples/sec: {(num_batches * batch_size) / duration:.2f}")
 
-    sort_by = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
-    profiler_table = profiler.key_averages().table(sort_by=sort_by, row_limit=10)
+    if duration > 0:
+        stage_labels = {
+            "data_wait": "Data wait",
+            "h2d_transfer": "Host→device transfer",
+            "forward": "Forward pass",
+            "backward": "Backward pass",
+            "optimizer": "Optimizer step",
+        }
+        info_lines.append("Stage breakdown:")
+        for key, label in stage_labels.items():
+            total = stage_totals[key]
+            percent = (total / duration) * 100 if duration else 0.0
+            avg_ms = (total / num_batches) * 1000 if num_batches else 0.0
+            info_lines.append(f"  {label}: {total:.3f}s total ({percent:.1f}%), avg {avg_ms:.2f} ms/batch")
 
-    return loss, info_lines, profiler_table
+    sort_by = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
+    tables: List[str] = []
+    tables.append("Top operators:\n" + profiler.key_averages().table(sort_by=sort_by, row_limit=10))
+
+    tables.append(
+        "Top operators by input shape:\n"
+        + profiler.key_averages(group_by_input_shape=True).table(sort_by=sort_by, row_limit=10)
+    )
+
+    if profiler_supports_stack:
+        tables.append(
+            "Hot call stacks:\n"
+            + profiler.key_averages(group_by_stack_n=5).table(sort_by=sort_by, row_limit=5)
+        )
+
+    return loss, info_lines, tables
 
 
 __all__ = [
