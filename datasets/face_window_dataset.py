@@ -22,6 +22,7 @@ configured output mode.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import multiprocessing as mp
 import os
@@ -367,6 +368,7 @@ class RandomFaceWindowDataset(TorchDataset):
         if batch_size <= 0:
             raise RuntimeError("Configured batch_size must be positive to sample a batch")
 
+        rng_state = copy.deepcopy(self.rng.bit_generator.state)
         process_count = self._determine_process_count()
         max_batches = max(1, math.ceil(self.epoch_size / batch_size))
 
@@ -375,16 +377,19 @@ class RandomFaceWindowDataset(TorchDataset):
         try:
             if process_count > 1:
                 pool, seed_queue = self._initialize_worker_pool(process_count)
-            for _ in range(max_batches):
-                yield self._sample_batch(
-                    include_context=include_context,
-                    dataset_name=dataset_name,
-                    video_index=video_index,
-                    process_count=process_count,
-                    pool=pool,
-                )
+            try:
+                for _ in range(max_batches):
+                    yield self._sample_batch(
+                        include_context=include_context,
+                        dataset_name=dataset_name,
+                        video_index=video_index,
+                        process_count=process_count,
+                        pool=pool,
+                    )
+            finally:
+                self._teardown_worker_pool(pool, seed_queue)
         finally:
-            self._teardown_worker_pool(pool, seed_queue)
+            self.rng.bit_generator.state = rng_state
 
     # ------------------------------------------------------------------
     # Public helpers
