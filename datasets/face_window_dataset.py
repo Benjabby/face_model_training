@@ -52,6 +52,7 @@ class _VideoEntry:
     video_path: str
     num_frames: int
     heart_rates: np.ndarray
+    frame_times: np.ndarray
 
 
 class RandomFaceWindowDataset(TorchDataset):
@@ -249,6 +250,7 @@ class RandomFaceWindowDataset(TorchDataset):
                 video_path=video_path,
                 num_frames=camera.nframes,
                 heart_rates=heart_rates,
+                frame_times=frame_times,
             )
         finally:
             if camera is not None:
@@ -268,8 +270,7 @@ class RandomFaceWindowDataset(TorchDataset):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         capture = cv2.VideoCapture(entry.video_path)
         try:
-            if start_frame > 0:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            self._fast_forward_camera(camera, start_frame)
 
             frames = torch.empty(
                 (self.window_size, 3, self.image_size, self.image_size),
@@ -279,12 +280,14 @@ class RandomFaceWindowDataset(TorchDataset):
             last_bbox: Optional[Tuple[int, int, int, int]] = None
 
             for frame_idx in range(self.window_size):
-                success, frame_bgr = capture.read()
-                if not success:
+                try:
+                    frame_bgr, _ = next(camera)
+                except StopIteration as exc:
                     raise RuntimeError(
                         f"Failed to read frame {start_frame + frame_idx} from '{entry.video_path}'"
-                    )
+                    ) from exc
 
+                frame_bgr = frame_bgr.copy()
                 frame_bgr = self._apply_pre_transforms(frame_bgr, rng)
                 bbox, visibility = self._detect_face(frame_bgr, last_bbox)
                 face_rgb, adjusted_bbox = self._extract_face(frame_bgr, bbox)
@@ -297,7 +300,17 @@ class RandomFaceWindowDataset(TorchDataset):
 
             return frames, metadata
         finally:
-            capture.release()
+            camera.close()
+
+    def _fast_forward_camera(self, camera: CameraData, frames_to_skip: int) -> None:
+        if frames_to_skip <= 0:
+            return
+        try:
+            camera.skip(frames_to_skip)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to skip {frames_to_skip} frames within camera stream"
+            ) from exc
 
     def _apply_pre_transforms(
         self, frame_bgr: np.ndarray, rng: np.random.Generator

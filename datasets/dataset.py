@@ -102,9 +102,14 @@ class CameraData(metaclass=ABCMeta):
     @abstractmethod
     def __next__(self):
         pass
-        
+
     @abstractmethod
     def close(self):
+        pass
+
+    @abstractmethod
+    def skip(self, frames_to_skip):
+        """Advance the stream by ``frames_to_skip`` frames without decoding them."""
         pass
         
 
@@ -152,7 +157,8 @@ class _CameraDataVideo(CameraData):
         
     def reset(self):
         self.curr_frame = 0
-        self._cam = self.cv2.VideoCapture(path)
+        self._cam.release()
+        self._cam = cv2.VideoCapture(self._path)
         
     def __next__(self):
         okay, _ = self._cam.read(self._frame)
@@ -163,10 +169,37 @@ class _CameraDataVideo(CameraData):
             t = self.times[self.curr_frame]
             self.curr_frame += 1
             return self._frame, t
-    
+
     def close(self):
         self._cam.release()
-    
+
+    def skip(self, frames_to_skip):
+        if frames_to_skip < 0:
+            raise ValueError("frames_to_skip must be non-negative")
+        target = self.curr_frame + frames_to_skip
+        if target >= self.nframes:
+            raise RuntimeError(
+                "Cannot skip beyond available frames (requested {}, total {})".format(
+                    target, self.nframes
+                )
+            )
+        if frames_to_skip == 0:
+            return
+        if not self._cam.set(cv2.CAP_PROP_POS_FRAMES, target):
+            # Fall back to iterative skipping using `grab` to avoid decoding frames.
+            remaining = frames_to_skip
+            while remaining > 0:
+                if not self._cam.grab():
+                    self._cam.release()
+                    raise RuntimeError(
+                        "Failed to skip frame {} while seeking within '{}'".format(
+                            self.curr_frame + (frames_to_skip - remaining), self._path
+                        )
+                    )
+                self.curr_frame += 1
+                remaining -= 1
+        self.curr_frame = target
+
 class _CameraDataFrames(CameraData):
     
     def __init__(self, path, timestamps=None):
@@ -179,8 +212,6 @@ class _CameraDataFrames(CameraData):
         
         self.curr_frame = 0
         
-        if timestamps is None:
-            breakpoint()
         assert timestamps is not None, "_CameraDataFrames must be instantiated with timestamps"
         if len(timestamps)<self.nframes:
             raise RuntimeError("Timestamps provided for for video at '{}' do not contain enough entries for the frames of the video file ({} timestamps for {} frames)".format(path,len(timestamps),self.nframes))
@@ -224,6 +255,18 @@ class _CameraDataFrames(CameraData):
             
     def close(self):
         pass
+
+    def skip(self, frames_to_skip):
+        if frames_to_skip < 0:
+            raise ValueError("frames_to_skip must be non-negative")
+        target = self.curr_frame + frames_to_skip
+        if target >= self.nframes:
+            raise RuntimeError(
+                "Cannot skip beyond available frames (requested {}, total {})".format(
+                    target, self.nframes
+                )
+            )
+        self.curr_frame = target
 
 # class DatasetGenerator:
     ####TODO
