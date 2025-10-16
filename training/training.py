@@ -107,10 +107,10 @@ def train_one_epoch(
     use_amp = amp_enabled and device.type == "cuda"
     scaler = scaler or _create_grad_scaler(use_amp)
 
-    for batch in dataloader:
-        frames = batch["frames"].to(device, non_blocking=use_amp)
-        metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
-        targets = batch["heart_rates"].to(device, non_blocking=use_amp)
+    for frames, metadata, targets in dataloader:
+        frames = frames.to(device, non_blocking=use_amp)
+        metadata = metadata.to(device, non_blocking=use_amp)
+        targets = targets.to(device, non_blocking=use_amp)
 
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, use_amp):
@@ -145,10 +145,10 @@ def evaluate(
     use_amp = amp_enabled and device.type == "cuda"
 
     with torch.no_grad():
-        for batch in dataloader:
-            frames = batch["frames"].to(device, non_blocking=use_amp)
-            metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
-            targets = batch["heart_rates"].to(device, non_blocking=use_amp)
+        for frames, metadata, targets in dataloader:
+            frames = frames.to(device, non_blocking=use_amp)
+            metadata = metadata.to(device, non_blocking=use_amp)
+            targets = targets.to(device, non_blocking=use_amp)
 
             with _autocast_context(device, use_amp):
                 predictions, _, visibility = model(frames, metadata)
@@ -342,13 +342,13 @@ def _profile_train_epoch(
             batches = 0
             batch_wait_start = perf_counter()
 
-            for batch in dataloader:
+            for frames, metadata, targets in dataloader:
                 stage_totals["data_wait"] += perf_counter() - batch_wait_start
 
                 transfer_start = perf_counter()
-                frames = batch["frames"].to(device, non_blocking=use_amp)
-                metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
-                targets = batch["heart_rates"].to(device, non_blocking=use_amp)
+                frames = frames.to(device, non_blocking=use_amp)
+                metadata = metadata.to(device, non_blocking=use_amp)
+                targets = targets.to(device, non_blocking=use_amp)
                 stage_totals["h2d_transfer"] += perf_counter() - transfer_start
 
                 optimizer.zero_grad(set_to_none=True)

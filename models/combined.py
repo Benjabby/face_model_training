@@ -27,7 +27,7 @@ class Combined(nn.Module):
         return_scalar_heart_rate: bool = True,
     ) -> None:
         super().__init__()
-        self.frame_encoder = frame_encoder or FrameEncoder()
+        self.frame_encoder = frame_encoder or FrameEncoder(in_channels=6)
         self.return_scalar_heart_rate = return_scalar_heart_rate
 
         if temporal_encoder is None:
@@ -46,7 +46,8 @@ class Combined(nn.Module):
 
         Args:
             frames: Either ``[B, S, C, H, W]`` or ``[S, C, H, W]`` tensors of
-                RGB frames with ``C == 3``.
+                face crops with ``C`` matching the frame encoder's expected
+                channel count (default ``6`` when using the built-in encoder).
             metadata: Either ``[B, S, 5]`` or ``[S, 5]`` tensors containing the
                 per-frame face metadata aligned with ``frames``.
 

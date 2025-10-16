@@ -6,8 +6,13 @@ datasets.  Each standard sample is composed of ``window_size`` consecutive face
 crops and associated metadata, while a dedicated helper can additionally return
 scene context suitable for visualization.  The dataset integrates with
 PyTorch's :class:`~torch.utils.data.DataLoader` to deliver batches shaped
-``(B, window_size, 3, image_size, image_size)`` for the face tensors and
+``(B, window_size, 6, image_size, image_size)`` for the face tensors and
 ``(B, window_size, 5)`` for the face metadata.
+
+The face tensor's channel dimension is organized such that the first three
+channels contain the normalized RGB data while channels 3-5 (zero-indexed)
+store the per-frame differences (current RGB frame minus the previous frame,
+with zeros for the initial timestep).
 
 The dataset randomly chooses a source video from the configured datasets and a
 valid starting frame for every request, enabling arbitrarily long epochs without
@@ -288,9 +293,10 @@ class RandomFaceWindowDataset(TorchDataset):
             raise RuntimeError("Configured batch_size must be positive to determine length")
         return max(1, math.ceil(self._epoch_size / batch_size))
 
-    def __getitem__(self, index: int) -> Dict[str, Union[str, int, torch.Tensor]]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with self._time_section("__getitem__"):
-            return self._sample_window(include_context=False)
+            sample = self._sample_window(include_context=False)
+            return self._sample_to_tuple(sample)
 
     def get_window_with_context(
         self,
@@ -327,7 +333,7 @@ class RandomFaceWindowDataset(TorchDataset):
                 video_index=video_index,
             )
 
-    def __iter__(self) -> Iterable[Dict[str, Union[str, int, torch.Tensor]]]:
+    def __iter__(self) -> Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         return self.iter_batches(include_context=False)
 
     def get_batch(
@@ -336,14 +342,19 @@ class RandomFaceWindowDataset(TorchDataset):
         include_context: bool = False,
         dataset_name: Optional[str] = None,
         video_index: Optional[int] = None,
-    ) -> Dict[str, Union[str, int, torch.Tensor]]:
+    ) -> Union[
+        Dict[str, Union[str, int, torch.Tensor]],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """Return a single randomized batch of windows.
 
-        The returned mapping matches the batch structure produced by PyTorch's
-        :class:`~torch.utils.data.DataLoader`, containing collated tensors for
-        each field (``"frames"``, ``"face_metadata"``, ``"heart_rates"``, and so
-        on).  Multiprocessing workers are spawned on demand according to the
-        dataset's configuration and are kept alive for reuse whenever possible.
+        When ``include_context`` is ``False`` the method returns a tuple
+        ``(frames, metadata, heart_rates)`` matching the structure produced by
+        a standard PyTorch ``DataLoader`` that yields tuples.  When context is
+        requested, a dictionary containing all batch fields (including
+        ``"context_frames"``) is returned instead.  Multiprocessing workers are
+        spawned on demand according to the dataset's configuration and are kept
+        alive for reuse whenever possible.
 
         Parameters
         ----------
@@ -370,7 +381,12 @@ class RandomFaceWindowDataset(TorchDataset):
         include_context: bool = False,
         dataset_name: Optional[str] = None,
         video_index: Optional[int] = None,
-    ) -> Iterable[Dict[str, Union[str, int, torch.Tensor]]]:
+    ) -> Iterable[
+        Union[
+            Dict[str, Union[str, int, torch.Tensor]],
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ]
+    ]:
         """Yield randomized batches using the dataset's multiprocessing setup."""
 
         batch_size = self._batch_size
@@ -458,7 +474,10 @@ class RandomFaceWindowDataset(TorchDataset):
         video_index: Optional[int],
         process_count: Optional[int] = None,
         pool: Optional[mp.pool.Pool] = None,
-    ) -> Dict[str, Union[str, int, torch.Tensor]]:
+    ) -> Union[
+        Dict[str, Union[str, int, torch.Tensor]],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         batch_size = self._batch_size
         if batch_size <= 0:
             raise RuntimeError("Configured batch_size must be positive to sample a batch")
@@ -488,7 +507,35 @@ class RandomFaceWindowDataset(TorchDataset):
             ]
             samples = pool.map(_multiprocess_worker_sample, task_args)
 
-        return default_collate(samples)
+        collated = default_collate(samples)
+        if include_context:
+            return collated
+        return self._collated_to_tuple(collated)
+
+    @staticmethod
+    def _sample_to_tuple(
+        sample: Dict[str, Union[str, int, torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        frames = sample["frames"]
+        metadata = sample["face_metadata"]
+        heart_rates = sample["heart_rates"]
+        if not isinstance(frames, torch.Tensor) or not isinstance(
+            metadata, torch.Tensor
+        ) or not isinstance(heart_rates, torch.Tensor):
+            raise TypeError("Sample components must be torch.Tensors")
+        return frames, metadata, heart_rates
+
+    def _collated_to_tuple(
+        self, collated: Dict[str, Union[str, int, torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        frames = collated["frames"]
+        metadata = collated["face_metadata"]
+        heart_rates = collated["heart_rates"]
+        if not isinstance(frames, torch.Tensor) or not isinstance(
+            metadata, torch.Tensor
+        ) or not isinstance(heart_rates, torch.Tensor):
+            raise TypeError("Batch components must be torch.Tensors")
+        return frames, metadata, heart_rates
 
     def _ensure_worker_pool(self, process_count: int) -> Optional[mp.pool.Pool]:
         if process_count <= 1:
@@ -647,6 +694,7 @@ class RandomFaceWindowDataset(TorchDataset):
                 active_rng,
                 include_context=include_context,
             )
+            frames = self._append_frame_differences(frames)
             heart_rates = self._slice_heart_rates(entry, start_frame)
             sample: Dict[str, Union[str, int, torch.Tensor]] = {
                 "frames": frames,
@@ -870,6 +918,19 @@ class RandomFaceWindowDataset(TorchDataset):
                     raise RuntimeError("No heart-rate values available for the requested window")
                 return values.mean()
             return values
+
+    def _append_frame_differences(self, frames: torch.Tensor) -> torch.Tensor:
+        with self._time_section("_append_frame_differences"):
+            if frames.ndim != 4:
+                raise ValueError("Frame tensors must have shape (S, C, H, W)")
+            if frames.shape[1] != 3:
+                raise ValueError("Frame tensors must contain exactly three channels")
+
+            diffs = torch.zeros_like(frames)
+            if frames.shape[0] > 1:
+                diffs[1:].copy_(frames[1:] - frames[:-1])
+            combined = torch.cat((frames, diffs), dim=1)
+            return combined
 
     def _read_face_window(
         self,

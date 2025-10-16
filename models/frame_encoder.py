@@ -11,7 +11,7 @@ class FrameEncoder(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 3,
+        in_channels: int = 6,
         image_size: int = 112,
         patch_size: int = 16,
         embed_dim: int = 128,
@@ -85,7 +85,9 @@ class FrameEncoder(nn.Module):
         """Encode frames and metadata.
 
         Args:
-            frames: Either ``[B, 3, 112, 112]`` or ``[B, S, 3, 112, 112]`` tensors.
+            frames: Either ``[B, C, 112, 112]`` or ``[B, S, C, 112, 112]`` tensors
+            with ``C`` matching the ``in_channels`` value provided at
+            initialization.
             metadata: Either ``[B, 5]`` or ``[B, S, 5]`` tensors aligned with ``frames``.
 
         Returns:
