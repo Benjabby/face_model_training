@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from time import perf_counter
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -314,13 +314,13 @@ class RandomFaceWindowDataset(TorchDataset):
         include_context: bool = False,
         dataset_name: Optional[str] = None,
         video_index: Optional[int] = None,
-    ) -> "RandomFaceWindowDataLoader":
+    ) -> Iterable[Dict[str, Union[str, int, torch.Tensor]]]:
         """Return an iterable that yields randomized batches of windows.
 
-        The returned object mimics PyTorch's :class:`~torch.utils.data.DataLoader`
-        API: iterating over it produces ``ceil(epoch_size / batch_size)`` batches
-        composed of ``batch_size`` independent samples.  Batches are produced
-        using the dataset's configured multiprocessing settings.
+        The iterable mirrors PyTorch's :class:`~torch.utils.data.DataLoader`
+        semantics—iterating over it produces ``ceil(epoch_size / batch_size)``
+        batches composed of ``batch_size`` independent samples using the
+        dataset's configured multiprocessing settings.
 
         Parameters
         ----------
@@ -331,12 +331,42 @@ class RandomFaceWindowDataset(TorchDataset):
             sampling to a particular dataset or video.
         """
 
-        return RandomFaceWindowDataLoader(
-            dataset=self,
-            include_context=include_context,
-            dataset_name=dataset_name,
-            video_index=video_index,
-        )
+        batch_size = self._batch_size
+        if batch_size <= 0:
+            raise RuntimeError("Configured batch_size must be positive to sample a batch")
+
+        process_count = self._determine_process_count()
+        max_batches = max(1, math.ceil(self.epoch_size / batch_size))
+
+        dataset = self
+
+        def batch_generator() -> Iterable[Dict[str, Union[str, int, torch.Tensor]]]:
+            pool: Optional[mp.pool.Pool] = None
+            seed_queue: Optional["mp.queues.Queue"] = None
+            try:
+                if process_count > 1:
+                    pool, seed_queue = dataset._initialize_worker_pool(process_count)
+                for _ in range(max_batches):
+                    yield dataset._sample_batch(
+                        include_context=include_context,
+                        dataset_name=dataset_name,
+                        video_index=video_index,
+                        process_count=process_count,
+                        pool=pool,
+                    )
+            finally:
+                dataset._teardown_worker_pool(pool, seed_queue)
+
+        class _BatchIterable:
+            __slots__ = ()
+
+            def __iter__(self_nonlocal):
+                return batch_generator()
+
+            def __len__(self_nonlocal) -> int:
+                return max_batches
+
+        return _BatchIterable()
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -420,6 +450,45 @@ class RandomFaceWindowDataset(TorchDataset):
             samples = pool.map(_multiprocess_worker_sample, task_args)
 
         return default_collate(samples)
+
+    def _initialize_worker_pool(
+        self, process_count: int
+    ) -> Tuple[mp.pool.Pool, "mp.queues.Queue"]:
+        ctx = _resolve_multiprocessing_context()
+        state = self.__getstate__()
+        seed_queue: "mp.queues.Queue" = ctx.Queue()
+
+        try:
+            max_uint32 = np.iinfo(np.uint32).max
+            for _ in range(process_count):
+                seed_value = int(self.rng.integers(0, max_uint32, dtype=np.uint32))
+                seed_queue.put(seed_value)
+
+            pool = ctx.Pool(
+                processes=process_count,
+                initializer=_multiprocess_worker_init,
+                initargs=(state, seed_queue),
+            )
+        except Exception:
+            if seed_queue is not None:
+                seed_queue.close()
+                seed_queue.join_thread()
+            raise
+
+        return pool, seed_queue
+
+    def _teardown_worker_pool(
+        self,
+        pool: Optional[mp.pool.Pool],
+        seed_queue: Optional["mp.queues.Queue"],
+    ) -> None:
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+        if seed_queue is not None:
+            seed_queue.close()
+            seed_queue.join_thread()
 
     def train_test_split(
         self,
@@ -1179,122 +1248,6 @@ class RandomFaceWindowDataset(TorchDataset):
         elif tensor.max() > 1.0:
             tensor.mul_(1.0 / 255.0)
         return tensor
-
-
-class RandomFaceWindowDataLoader:
-    """Lightweight iterable that mirrors PyTorch's DataLoader semantics."""
-
-    def __init__(
-        self,
-        *,
-        dataset: RandomFaceWindowDataset,
-        include_context: bool,
-        dataset_name: Optional[str],
-        video_index: Optional[int],
-    ) -> None:
-        self._dataset = dataset
-        self._include_context = include_context
-        self._dataset_name = dataset_name
-        self._video_index = video_index
-
-        self._batch_size = dataset._batch_size
-        if self._batch_size <= 0:
-            raise RuntimeError("Configured batch_size must be positive to sample a batch")
-
-        self._process_count = dataset._determine_process_count()
-        self._max_batches = max(1, math.ceil(dataset.epoch_size / self._batch_size))
-
-    def __iter__(self) -> "_RandomFaceWindowBatchIterator":
-        return _RandomFaceWindowBatchIterator(self)
-
-    def __len__(self) -> int:
-        return self._max_batches
-
-
-class _RandomFaceWindowBatchIterator:
-    """Iterator responsible for producing batches from a dataset."""
-
-    def __init__(self, loader: RandomFaceWindowDataLoader) -> None:
-        self._loader = loader
-        self._dataset = loader._dataset
-        self._include_context = loader._include_context
-        self._dataset_name = loader._dataset_name
-        self._video_index = loader._video_index
-        self._batch_size = loader._batch_size
-        self._process_count = loader._process_count
-        self._max_batches = loader._max_batches
-        self._yielded = 0
-
-        self._ctx: Optional[mp.context.BaseContext] = None
-        self._pool: Optional[mp.pool.Pool] = None
-        self._seed_queue: Optional["mp.queues.Queue"] = None
-
-        if self._process_count > 1:
-            self._initialize_pool()
-
-    def __iter__(self) -> "_RandomFaceWindowBatchIterator":
-        return self
-
-    def __next__(self) -> Dict[str, Union[str, int, torch.Tensor]]:
-        if self._max_batches is not None and self._yielded >= self._max_batches:
-            self.close()
-            raise StopIteration
-
-        batch = self._dataset._sample_batch(
-            include_context=self._include_context,
-            dataset_name=self._dataset_name,
-            video_index=self._video_index,
-            process_count=self._process_count,
-            pool=self._pool,
-        )
-
-        self._yielded += 1
-        return batch
-
-    def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
-            self._pool.join()
-            self._pool = None
-
-        if self._seed_queue is not None:
-            self._seed_queue.close()
-            self._seed_queue.join_thread()
-            self._seed_queue = None
-
-        self._ctx = None
-
-    def _initialize_pool(self) -> None:
-        ctx = _resolve_multiprocessing_context()
-        state = self._dataset.__getstate__()
-        seed_queue = ctx.Queue()
-
-        try:
-            max_uint32 = np.iinfo(np.uint32).max
-            for _ in range(self._process_count):
-                seed_value = int(
-                    self._dataset.rng.integers(0, max_uint32, dtype=np.uint32)
-                )
-                seed_queue.put(seed_value)
-
-            pool = ctx.Pool(
-                processes=self._process_count,
-                initializer=_multiprocess_worker_init,
-                initargs=(state, seed_queue),
-            )
-        except Exception:
-            seed_queue.close()
-            seed_queue.join_thread()
-            raise
-
-        self._ctx = ctx
-        self._seed_queue = seed_queue
-        self._pool = pool
-
-    def __del__(self) -> None:  # pragma: no cover - defensive cleanup
-        self.close()
-
-
 def _resolve_multiprocessing_context() -> mp.context.BaseContext:
     available = mp.get_all_start_methods()
     method = "fork" if "fork" in available else "spawn"
@@ -1341,7 +1294,5 @@ def _multiprocess_worker_sample(
         dataset_name=dataset_name,
         video_index=video_index,
     )
-
-
-__all__ = ["RandomFaceWindowDataset", "RandomFaceWindowDataLoader"]
+__all__ = ["RandomFaceWindowDataset"]
 
