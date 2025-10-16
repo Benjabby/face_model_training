@@ -8,10 +8,23 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from tqdm.auto import tqdm
 
 from ..datasets.face_window_dataset import RandomFaceWindowDataset
 from ..models import Combined
+
+
+_amp_module = getattr(torch, "amp", None)
+if _amp_module is not None and hasattr(_amp_module, "GradScaler"):
+    from torch.amp import GradScaler  # type: ignore[attr-defined]
+    from torch.amp import autocast as _autocast  # type: ignore[attr-defined]
+
+    _AMP_REQUIRES_DEVICE_TYPE = True
+else:  # pragma: no cover - fallback for older PyTorch versions
+    from torch.cuda.amp import GradScaler  # type: ignore
+    from torch.cuda.amp import autocast as _autocast  # type: ignore
+
+    _AMP_REQUIRES_DEVICE_TYPE = False
 
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, visibility: Tensor) -> Tensor:
@@ -72,8 +85,7 @@ def train_one_epoch(
     running_loss = 0.0
     batches = 0
     use_amp = amp_enabled and device.type == "cuda"
-    scaler = scaler or GradScaler(enabled=use_amp)
-    autocast_cm = autocast if use_amp else nullcontext
+    scaler = scaler or _create_grad_scaler(use_amp)
 
     for batch in dataloader:
         frames = batch["frames"].to(device, non_blocking=use_amp)
@@ -81,7 +93,7 @@ def train_one_epoch(
         targets = batch["heart_rates"].to(device, non_blocking=use_amp)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast_cm():
+        with _autocast_context(device, use_amp):
             predictions, _, visibility = model(frames, metadata)
             loss = loss_fn(predictions, targets, visibility)
 
@@ -111,7 +123,6 @@ def evaluate(
     running_loss = 0.0
     batches = 0
     use_amp = amp_enabled and device.type == "cuda"
-    autocast_cm = autocast if use_amp else nullcontext
 
     with torch.no_grad():
         for batch in dataloader:
@@ -119,7 +130,7 @@ def evaluate(
             metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
             targets = batch["heart_rates"].to(device, non_blocking=use_amp)
 
-            with autocast_cm():
+            with _autocast_context(device, use_amp):
                 predictions, _, visibility = model(frames, metadata)
                 loss = loss_fn(predictions, targets, visibility)
 
@@ -176,7 +187,7 @@ def train(
 
     optimizer = optimizer or torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_fn = loss_fn or masked_mse_loss
-    scaler = grad_scaler or GradScaler(enabled=amp_enabled)
+    scaler = grad_scaler or _create_grad_scaler(amp_enabled)
 
     train_loader = _make_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
@@ -191,7 +202,8 @@ def train(
     if val_loader is not None:
         history["val_loss"] = []
 
-    for _ in range(epochs):
+    progress_bar = tqdm(range(1, epochs + 1), desc="Training", unit="epoch")
+    for _ in progress_bar:
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -212,11 +224,29 @@ def train(
                 amp_enabled=amp_enabled,
             )
             history["val_loss"].append(val_loss)
+            progress_bar.set_postfix({"train_loss": f"{train_loss:.4f}", "val_loss": f"{val_loss:.4f}"})
+        else:
+            progress_bar.set_postfix({"train_loss": f"{train_loss:.4f}"})
 
         if scheduler is not None:
             scheduler.step()
 
     return history
+
+
+def _create_grad_scaler(enabled: bool) -> GradScaler:
+    kwargs = {"enabled": enabled}
+    if _AMP_REQUIRES_DEVICE_TYPE:
+        kwargs["device_type"] = "cuda"
+    return GradScaler(**kwargs)
+
+
+def _autocast_context(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if _AMP_REQUIRES_DEVICE_TYPE:
+        return _autocast(device_type=device.type)
+    return _autocast()
 
 
 __all__ = [
