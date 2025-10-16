@@ -328,51 +328,63 @@ def _profile_train_epoch(
         "optimizer": 0.0,
     }
 
+    dataset = getattr(dataloader, "dataset", None)
+    dataset_instrumented = isinstance(dataset, RandomFaceWindowDataset)
+    dataset_worker_warning = dataset_instrumented and getattr(dataloader, "num_workers", 0) > 0
+    dataset_timings: Dict[str, Dict[str, float]] = {}
+    if dataset_instrumented:
+        dataset.enable_timing(reset=True)
+
     start_time = perf_counter()
-    with torch_profile(**profile_kwargs) as profiler:
-        running_loss = 0.0
-        batches = 0
-        batch_wait_start = perf_counter()
-
-        for batch in dataloader:
-            stage_totals["data_wait"] += perf_counter() - batch_wait_start
-
-            transfer_start = perf_counter()
-            frames = batch["frames"].to(device, non_blocking=use_amp)
-            metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
-            targets = batch["heart_rates"].to(device, non_blocking=use_amp)
-            stage_totals["h2d_transfer"] += perf_counter() - transfer_start
-
-            optimizer.zero_grad(set_to_none=True)
-
-            forward_start = perf_counter()
-            with _autocast_context(device, use_amp):
-                predictions, _, visibility = model(frames, metadata)
-                loss = loss_fn(predictions, targets, visibility)
-            stage_totals["forward"] += perf_counter() - forward_start
-
-            backward_start = perf_counter()
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                stage_totals["backward"] += perf_counter() - backward_start
-
-                optimizer_start = perf_counter()
-                scaler.step(optimizer)
-                stage_totals["optimizer"] += perf_counter() - optimizer_start
-                scaler.update()
-            else:
-                loss.backward()
-                stage_totals["backward"] += perf_counter() - backward_start
-
-                optimizer_start = perf_counter()
-                optimizer.step()
-                stage_totals["optimizer"] += perf_counter() - optimizer_start
-
-            running_loss += loss.item()
-            batches += 1
+    try:
+        with torch_profile(**profile_kwargs) as profiler:
+            running_loss = 0.0
+            batches = 0
             batch_wait_start = perf_counter()
 
-        loss = running_loss / max(batches, 1)
+            for batch in dataloader:
+                stage_totals["data_wait"] += perf_counter() - batch_wait_start
+
+                transfer_start = perf_counter()
+                frames = batch["frames"].to(device, non_blocking=use_amp)
+                metadata = batch["face_metadata"].to(device, non_blocking=use_amp)
+                targets = batch["heart_rates"].to(device, non_blocking=use_amp)
+                stage_totals["h2d_transfer"] += perf_counter() - transfer_start
+
+                optimizer.zero_grad(set_to_none=True)
+
+                forward_start = perf_counter()
+                with _autocast_context(device, use_amp):
+                    predictions, _, visibility = model(frames, metadata)
+                    loss = loss_fn(predictions, targets, visibility)
+                stage_totals["forward"] += perf_counter() - forward_start
+
+                backward_start = perf_counter()
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    stage_totals["backward"] += perf_counter() - backward_start
+
+                    optimizer_start = perf_counter()
+                    scaler.step(optimizer)
+                    stage_totals["optimizer"] += perf_counter() - optimizer_start
+                    scaler.update()
+                else:
+                    loss.backward()
+                    stage_totals["backward"] += perf_counter() - backward_start
+
+                    optimizer_start = perf_counter()
+                    optimizer.step()
+                    stage_totals["optimizer"] += perf_counter() - optimizer_start
+
+                running_loss += loss.item()
+                batches += 1
+                batch_wait_start = perf_counter()
+
+            loss = running_loss / max(batches, 1)
+    finally:
+        if dataset_instrumented:
+            dataset_timings = dataset.collect_timings(reset=True)
+            dataset.disable_timing()
     duration = perf_counter() - start_time
 
     summary = profiler.key_averages().total_average()
@@ -405,6 +417,18 @@ def _profile_train_epoch(
             percent = (total / duration) * 100 if duration else 0.0
             avg_ms = (total / num_batches) * 1000 if num_batches else 0.0
             info_lines.append(f"  {label}: {total:.3f}s total ({percent:.1f}%), avg {avg_ms:.2f} ms/batch")
+
+    if dataset_timings:
+        info_lines.append("RandomFaceWindowDataset timings:")
+        for name, stats in sorted(dataset_timings.items(), key=lambda item: item[1]["total"], reverse=True):
+            total = stats["total"]
+            count = stats["count"]
+            avg = stats["avg"]
+            info_lines.append(
+                f"  {name}: {total:.3f}s total over {count} calls (avg {avg * 1000.0:.2f} ms)"
+            )
+        if dataset_worker_warning:
+            info_lines.append("  Note: worker processes maintain independent timing records.")
 
     sort_by = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
     tables: List[str] = []
