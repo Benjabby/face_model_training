@@ -2,11 +2,12 @@
 
 This module provides a :class:`RandomFaceWindowDataset` that samples fixed-size
 temporal windows of cropped facial regions from multiple physiological video
-datasets.  Each sample is composed of ``window_size`` consecutive frames and is
-designed to integrate with PyTorch's :class:`~torch.utils.data.DataLoader` in
-order to deliver batches shaped ``(B, window_size, 6, image_size, image_size)``
-for the face tensors and ``(B, window_size, 5)`` for the associated face
-metadata.
+datasets.  Each standard sample is composed of ``window_size`` consecutive face
+crops and associated metadata, while a dedicated helper can additionally return
+scene context suitable for visualization.  The dataset integrates with
+PyTorch's :class:`~torch.utils.data.DataLoader` to deliver batches shaped
+``(B, window_size, 3, image_size, image_size)`` for the face tensors and
+``(B, window_size, 5)`` for the face metadata.
 
 The dataset randomly chooses a source video from the configured datasets and a
 valid starting frame for every request, enabling arbitrarily long epochs without
@@ -15,7 +16,6 @@ supported: pre-face-detection transforms that act on the full frame, and
 post-face-detection transforms that operate on the cropped face prior to
 conversion to tensors.  Each sample additionally includes a heart-rate sequence
 aligned with the returned frame window, producing batches shaped
-``(B, window_size, 3, image_size, image_size)`` for faces and
 ``(B, window_size)`` for heart rates.
 """
 
@@ -36,6 +36,10 @@ from .dataset import CameraData
 from .lgi_ppgi import LGI_PPGI
 from .pure import PURE
 from .ubfc import UBFC1, UBFC2
+from ..utils.augmentations import (
+    default_post_face_transforms,
+    default_pre_face_transforms,
+)
 from ..utils.face_utils import BaseDetector, select_face_detector
 
 
@@ -127,6 +131,12 @@ class RandomFaceWindowDataset(TorchDataset):
         self._post_face_transform_funcs: Tuple[
             Callable[[ArrayLike, np.random.Generator], ArrayLike], ...
         ] = ()
+        if pre_face_transforms is None:
+            pre_face_transforms = default_pre_face_transforms()
+        if post_face_transforms is None:
+            post_face_transforms = default_post_face_transforms(
+                window_size=self.window_size
+            )
         self.pre_face_transforms = pre_face_transforms
         self.post_face_transforms = post_face_transforms
         self.seed = seed
@@ -181,25 +191,14 @@ class RandomFaceWindowDataset(TorchDataset):
         return self._epoch_size
 
     def __getitem__(self, index: int) -> Dict[str, Union[str, int, torch.Tensor]]:
-        rng = self._get_rng()
-        entry_idx = int(rng.integers(0, len(self._videos)))
-        entry = self._videos[entry_idx]
-        max_start = entry.num_frames - self.window_size
-        if max_start <= 0:
-            raise RuntimeError(
-                f"Video '{entry.video_path}' does not contain enough frames for a window"
-            )
-        start_frame = int(rng.integers(0, max_start + 1))
-        frames, face_metadata = self._read_face_window(entry, start_frame, rng)
-        heart_rates = self._slice_heart_rates(entry, start_frame)
-        return {
-            "frames": frames,
-            "face_metadata": face_metadata,
-            "dataset": entry.dataset_name,
-            "video_index": entry.dataset_index,
-            "start_frame": start_frame,
-            "heart_rates": heart_rates,
-        }
+        return self._sample_window(include_context=False)
+
+    def get_window_with_context(
+        self, index: int = 0
+    ) -> Dict[str, Union[str, int, torch.Tensor]]:
+        """Return a randomly sampled window that preserves context frames."""
+
+        return self._sample_window(include_context=True)
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -220,6 +219,105 @@ class RandomFaceWindowDataset(TorchDataset):
     # Internal helpers
     def _get_rng(self) -> np.random.Generator:
         return self.rng
+
+    def _sample_window(
+        self,
+        *,
+        include_context: bool,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Dict[str, Union[str, int, torch.Tensor]]:
+        active_rng = self._get_rng() if rng is None else rng
+        entry, start_frame = self._select_entry_and_start(active_rng)
+        self._reset_transform_state(active_rng)
+        (
+            frames,
+            face_metadata,
+            context_frames,
+            context_transforms,
+        ) = self._read_face_window(
+            entry,
+            start_frame,
+            active_rng,
+            include_context=include_context,
+        )
+        heart_rates = self._slice_heart_rates(entry, start_frame)
+        sample: Dict[str, Union[str, int, torch.Tensor]] = {
+            "frames": frames,
+            "face_metadata": face_metadata,
+            "dataset": entry.dataset_name,
+            "video_index": entry.dataset_index,
+            "start_frame": start_frame,
+            "heart_rates": heart_rates,
+        }
+        if include_context:
+            assert context_frames is not None and context_transforms is not None
+            sample["context_frames"] = context_frames
+            sample["context_transforms"] = context_transforms
+        return sample
+
+    def _select_entry_and_start(
+        self, rng: np.random.Generator
+    ) -> Tuple[_VideoEntry, int]:
+        entry_idx = int(rng.integers(0, len(self._videos)))
+        entry = self._videos[entry_idx]
+        max_start = entry.num_frames - self.window_size
+        if max_start <= 0:
+            raise RuntimeError(
+                f"Video '{entry.video_path}' does not contain enough frames for a window"
+            )
+        start_frame = int(rng.integers(0, max_start + 1))
+        return entry, start_frame
+
+    def _reset_transform_state(self, rng: np.random.Generator) -> None:
+        for transform in self._pre_face_transforms + self._post_face_transforms:
+            self._invoke_transform_reset(transform, rng)
+
+    def _invoke_transform_reset(
+        self, transform: Callable[[ArrayLike], ArrayLike], rng: np.random.Generator
+    ) -> None:
+        reset = getattr(transform, "reset", None)
+        if not callable(reset):
+            return
+        try:
+            signature = inspect.signature(reset)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is None:
+            try:
+                reset(self.window_size, rng)
+                return
+            except TypeError:
+                try:
+                    reset(self.window_size)
+                    return
+                except TypeError:
+                    try:
+                        reset(rng)
+                        return
+                    except TypeError:
+                        reset()
+                        return
+
+        kwargs = {}
+        params = signature.parameters
+        if "window_size" in params:
+            kwargs["window_size"] = self.window_size
+        if "rng" in params:
+            kwargs["rng"] = rng
+        try:
+            reset(**kwargs)
+        except TypeError:
+            try:
+                reset(self.window_size, rng)
+            except TypeError:
+                try:
+                    reset(self.window_size)
+                except TypeError:
+                    try:
+                        reset(rng)
+                    except TypeError:
+                        reset()
 
     def _close_camera_cache(self) -> None:
         cache_dict = getattr(self, "_camera_cache", None)
@@ -336,8 +434,15 @@ class RandomFaceWindowDataset(TorchDataset):
         entry: _VideoEntry,
         start_frame: int,
         rng: np.random.Generator,
+        *,
+        include_context: bool,
         camera: Optional[CameraData] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         owns_camera = False
         cached_camera = False
         if camera is None:
@@ -357,11 +462,20 @@ class RandomFaceWindowDataset(TorchDataset):
                     self._invalidate_cached_camera(entry, camera)
                 raise
 
-            frames = torch.empty(
+            face_frames = torch.empty(
                 (self.window_size, 3, self.image_size, self.image_size),
                 dtype=torch.float32,
             )
             metadata = torch.zeros((self.window_size, 5), dtype=torch.float32)
+            if include_context:
+                context_frames = torch.empty(
+                    (self.window_size, 3, self.image_size, self.image_size),
+                    dtype=torch.float32,
+                )
+                context_transforms = torch.zeros((self.window_size, 5), dtype=torch.float32)
+            else:
+                context_frames = None
+                context_transforms = None
             last_bbox: Optional[Tuple[int, int, int, int]] = None
 
             for frame_idx in range(self.window_size):
@@ -380,12 +494,22 @@ class RandomFaceWindowDataset(TorchDataset):
                 face_rgb, adjusted_bbox = self._extract_face(frame_bgr, bbox)
                 last_bbox = adjusted_bbox
                 face_tensor = self._apply_post_transforms(face_rgb, rng)
-                frames[frame_idx].copy_(face_tensor)
+                face_frames[frame_idx].copy_(face_tensor)
+                if include_context:
+                    (
+                        context_tensor,
+                        transform_info,
+                    ) = self._prepare_context_frame(frame_bgr)
+                    assert context_frames is not None and context_transforms is not None
+                    context_frames[frame_idx].copy_(context_tensor)
+                    context_transforms[frame_idx].copy_(
+                        torch.as_tensor(transform_info, dtype=torch.float32)
+                    )
                 metadata[frame_idx].copy_(
                     self._build_face_metadata(adjusted_bbox, visibility, frame_bgr.shape)
                 )
 
-            return frames, metadata
+            return face_frames, metadata, context_frames, context_transforms
         finally:
             if owns_camera:
                 camera.close()
@@ -420,6 +544,43 @@ class RandomFaceWindowDataset(TorchDataset):
             self._post_face_transform_funcs, face_rgb, rng
         )
         return self._to_normalized_tensor(transformed)
+
+    def _prepare_context_frame(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[torch.Tensor, Tuple[float, float, float, float, float]]:
+        target_size = self.image_size
+        frame_h, frame_w = frame_bgr.shape[:2]
+        max_dim = max(frame_h, frame_w, 1)
+        scale = float(target_size) / float(max_dim)
+
+        new_w = max(1, int(round(frame_w * scale)))
+        new_h = max(1, int(round(frame_h * scale)))
+
+        interpolation = (
+            cv2.INTER_AREA
+            if frame_h > target_size or frame_w > target_size
+            else cv2.INTER_LINEAR
+        )
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=interpolation)
+
+        canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        pad_x = max(0, (target_size - new_w) // 2)
+        pad_y = max(0, (target_size - new_h) // 2)
+        canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
+
+        context_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        context_tensor = torch.as_tensor(context_rgb, dtype=torch.float32).permute(2, 0, 1)
+        if context_tensor.max() > 1.0:
+            context_tensor.mul_(1.0 / 255.0)
+
+        transform_info = (
+            scale,
+            float(pad_x),
+            float(pad_y),
+            float(frame_h),
+            float(frame_w),
+        )
+        return context_tensor, transform_info
 
     def _apply_transforms(
         self,
