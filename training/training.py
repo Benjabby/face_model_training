@@ -238,7 +238,20 @@ def _create_grad_scaler(enabled: bool) -> GradScaler:
     kwargs = {"enabled": enabled}
     if _AMP_REQUIRES_DEVICE_TYPE:
         kwargs["device_type"] = "cuda"
-    return GradScaler(**kwargs)
+
+    try:
+        return GradScaler(**kwargs)
+    except TypeError as exc:
+        if "device_type" not in kwargs:
+            raise
+        # Older torch.amp versions expose GradScaler but do not accept the
+        # device_type argument. Retry without it so training still works.
+        kwargs = dict(kwargs)
+        kwargs.pop("device_type", None)
+        try:
+            return GradScaler(**kwargs)
+        except TypeError:
+            raise exc
 
 
 def _autocast_context(device: torch.device, enabled: bool):
