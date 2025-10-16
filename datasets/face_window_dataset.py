@@ -105,10 +105,10 @@ class RandomFaceWindowDataset(TorchDataset):
     def __init__(
         self,
         *,
-        lgi_dir: Optional[str] = r"E:\face_datasets\LGI-PPGI",
-        pure_dir: Optional[str] = r"E:\face_datasets\PURE",
-        ubfc1_dir: Optional[str] = r"E:\face_datasets\UBFC1",
-        ubfc2_dir: Optional[str] = r"E:\face_datasets\UBFC2",
+        lgi_dir: Optional[str] = r"C:\Users\Ben\Desktop\face_datasets\LGI-PPGI",
+        pure_dir: Optional[str] = r"C:\Users\Ben\Desktop\face_datasets\PURE",
+        ubfc1_dir: Optional[str] = r"C:\Users\Ben\Desktop\face_datasets\UBFC1",
+        ubfc2_dir: Optional[str] = r"C:\Users\Ben\Desktop\face_datasets\UBFC2",
         window_size: int = 360,
         image_size: int = 112,
         epoch_size: int = 1000,
@@ -380,6 +380,20 @@ class RandomFaceWindowDataset(TorchDataset):
         clone._timing_enabled = False
         clone._timing_totals = {}
         clone._timing_counts = {}
+        return clone
+
+    def _clone_with_videos(
+        self,
+        videos: Sequence[_VideoEntry],
+        *,
+        seed: Optional[int],
+    ) -> "RandomFaceWindowDataset":
+        clone = self.__class__.__new__(self.__class__)
+        clone.__dict__ = self.__dict__.copy()
+        clone._videos = list(videos)
+        clone._camera_cache = {}
+        clone.seed = seed
+        clone.rng = np.random.default_rng(seed)
         return clone
 
     def _spawn_index_rng(self, index: int) -> np.random.Generator:
