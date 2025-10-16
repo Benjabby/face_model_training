@@ -569,7 +569,7 @@ class RandomFaceWindowDataset(TorchDataset):
         self, face_rgb: np.ndarray, rng: np.random.Generator
     ) -> Tuple[torch.Tensor, float]:
         data: ArrayLike = face_rgb
-        visibility_scale = 1.0
+        blackout = False
 
         for transform in self._post_face_transform_funcs:
             result = transform(data, rng)
@@ -579,12 +579,13 @@ class RandomFaceWindowDataset(TorchDataset):
                         "Post-face transforms must return (data, visibility) tuples"
                     )
                 data, visibility = result
-                visibility_scale *= self._coerce_visibility_factor(visibility)
+                if self._coerce_visibility_factor(visibility) <= 0.0:
+                    blackout = True
             else:
                 data = result
 
         tensor = self._to_normalized_tensor(data)
-        visibility_scale = float(np.clip(visibility_scale, 0.0, 1.0))
+        visibility_scale = 0.0 if blackout else 1.0
         return tensor, visibility_scale
 
     def _prepare_context_frame(
