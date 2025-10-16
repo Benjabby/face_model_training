@@ -6,5 +6,5 @@ from .pure import PURE, PURE_Compressed
 from .cohface import COHFACE
 from .v4v import V4V
 from .mahnob import MAHNOB
-from .face_window_dataset import RandomFaceWindowDataset, create_face_window_dataloader
+from .face_window_dataset import RandomFaceWindowDataset
 
