@@ -268,7 +268,7 @@ class RandomFaceWindowDataset(TorchDataset):
     def _read_face_window(
         self, entry: _VideoEntry, start_frame: int, rng: np.random.Generator
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        camera = CameraData.create(entry.video_path, timestamps=entry.frame_times)
+        capture = cv2.VideoCapture(entry.video_path)
         try:
             self._fast_forward_camera(camera, start_frame)
 
