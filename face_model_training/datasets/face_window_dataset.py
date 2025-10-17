@@ -175,6 +175,8 @@ class RandomFaceWindowDataset(TorchDataset):
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         self._cache_cameras = cache_cameras
+        self._tensor_device: torch.device = torch.device("cpu")
+        self._tensor_dtype: torch.dtype = torch.float32
         self._camera_cache: Dict[Optional[int], Dict[str, CameraData]] = {}
         self._mp_pool: Optional[mp.pool.Pool] = None
         self._mp_pool_process_count: Optional[int] = None
@@ -244,6 +246,10 @@ class RandomFaceWindowDataset(TorchDataset):
             self._mp_pool_process_count = None
         if "_reset_rng_each_epoch" not in self.__dict__:
             self._reset_rng_each_epoch = False
+        if "_tensor_device" not in self.__dict__:
+            self._tensor_device = torch.device("cpu")
+        if "_tensor_dtype" not in self.__dict__:
+            self._tensor_dtype = torch.float32
 
     # ------------------------------------------------------------------
     # Timing instrumentation
@@ -299,6 +305,67 @@ class RandomFaceWindowDataset(TorchDataset):
         with self._time_section("__getitem__"):
             sample = self._sample_window(include_context=False)
             return self._sample_to_tuple(sample)
+
+    # ------------------------------------------------------------------
+    # Tensor configuration helpers
+    def to(
+        self,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[Union[str, torch.dtype]] = None,
+    ) -> "RandomFaceWindowDataset":
+        """Adjust the device and dtype used for generated tensors."""
+
+        if device is not None:
+            self._tensor_device = torch.device(device)
+
+        if dtype is not None:
+            if isinstance(dtype, torch.dtype):
+                resolved_dtype = dtype
+            elif isinstance(dtype, str):
+                try:
+                    resolved_dtype = getattr(torch, dtype)
+                except AttributeError as exc:
+                    raise TypeError(f"Unsupported dtype string '{dtype}'") from exc
+            else:
+                raise TypeError("dtype must be a torch.dtype or string identifier")
+            self._tensor_dtype = resolved_dtype
+
+        return self
+
+    def cpu(self) -> "RandomFaceWindowDataset":
+        """Configure the dataset to emit tensors on the CPU."""
+
+        return self.to(device=torch.device("cpu"))
+
+    def cuda(
+        self, device: Optional[Union[int, str, torch.device]] = None
+    ) -> "RandomFaceWindowDataset":
+        """Configure the dataset to emit tensors on a CUDA device."""
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available on this system")
+
+        if device is None:
+            target = torch.device("cuda")
+        elif isinstance(device, int):
+            target = torch.device("cuda", device)
+        else:
+            target = torch.device(device)
+
+        if target.type != "cuda":
+            target = torch.device("cuda", target.index or 0)
+
+        return self.to(device=target)
+
+    def float(self) -> "RandomFaceWindowDataset":
+        """Configure the dataset to emit ``float32`` tensors."""
+
+        return self.to(dtype=torch.float32)
+
+    def double(self) -> "RandomFaceWindowDataset":
+        """Configure the dataset to emit ``float64`` tensors."""
+
+        return self.to(dtype=torch.float64)
 
     def get_window_with_context(
         self,
@@ -435,6 +502,18 @@ class RandomFaceWindowDataset(TorchDataset):
     @property
     def batch_size(self) -> int:
         return self._batch_size
+
+    @property
+    def tensor_device(self) -> torch.device:
+        """Return the device new tensors are materialized on."""
+
+        return self._tensor_device
+
+    @property
+    def tensor_dtype(self) -> torch.dtype:
+        """Return the dtype new tensors are materialized with."""
+
+        return self._tensor_dtype
 
     def set_batch_size(self, batch_size: int) -> None:
         if batch_size <= 0:
@@ -696,7 +775,6 @@ class RandomFaceWindowDataset(TorchDataset):
                 active_rng,
                 include_context=include_context,
             )
-            frames = self._append_frame_differences(frames)
             heart_rates = self._slice_heart_rates(entry, start_frame)
             sample: Dict[str, Union[str, int, torch.Tensor]] = {
                 "frames": frames,
@@ -918,21 +996,8 @@ class RandomFaceWindowDataset(TorchDataset):
             if self._heart_rate_as_scalar:
                 if values.numel() == 0:
                     raise RuntimeError("No heart-rate values available for the requested window")
-                return values.mean()
-            return values
-
-    def _append_frame_differences(self, frames: torch.Tensor) -> torch.Tensor:
-        with self._time_section("_append_frame_differences"):
-            if frames.ndim != 4:
-                raise ValueError("Frame tensors must have shape (S, C, H, W)")
-            if frames.shape[1] != 3:
-                raise ValueError("Frame tensors must contain exactly three channels")
-
-            diffs = torch.zeros_like(frames)
-            if frames.shape[0] > 1:
-                diffs[1:].copy_(frames[1:] - frames[:-1])
-            combined = torch.cat((frames, diffs), dim=1)
-            return combined
+                return self._convert_tensor(values.mean())
+            return self._convert_tensor(values)
 
     def _read_face_window(
         self,
@@ -969,12 +1034,18 @@ class RandomFaceWindowDataset(TorchDataset):
                     raise
 
                 face_frames = torch.empty(
-                    (self.window_size, 3, self.image_size, self.image_size),
-                    dtype=torch.float32,
+                    (self.window_size, 6, self.image_size, self.image_size),
+                    dtype=self._tensor_dtype,
+                    device=self._tensor_device,
                 )
-                metadata = torch.zeros((self.window_size, 5), dtype=torch.float32)
+                metadata = torch.empty(
+                    (self.window_size, 5),
+                    dtype=self._tensor_dtype,
+                    device=self._tensor_device,
+                )
                 context_frames_list: List[torch.Tensor] = []
                 last_bbox: Optional[Tuple[int, int, int, int]] = None
+                prev_rgb_view: Optional[torch.Tensor] = None
 
                 for frame_idx in range(self.window_size):
                     try:
@@ -994,7 +1065,15 @@ class RandomFaceWindowDataset(TorchDataset):
                     face_tensor, post_visibility = self._apply_post_transforms(
                         face_rgb, rng
                     )
-                    face_frames[frame_idx].copy_(face_tensor)
+                    face_tensor = self._convert_tensor(face_tensor)
+                    rgb_view = face_frames[frame_idx, :3]
+                    rgb_view.copy_(face_tensor)
+                    diff_view = face_frames[frame_idx, 3:]
+                    if prev_rgb_view is None:
+                        diff_view.zero_()
+                    else:
+                        torch.sub(rgb_view, prev_rgb_view, out=diff_view)
+                    prev_rgb_view = rgb_view
                     if include_context:
                         context_frames_list.append(self._prepare_context_frame(frame_bgr))
                     combined_visibility = visibility * post_visibility
@@ -1073,7 +1152,7 @@ class RandomFaceWindowDataset(TorchDataset):
             context_tensor = torch.as_tensor(frame_rgb, dtype=torch.float32).permute(2, 0, 1)
             if context_tensor.max() > 1.0:
                 context_tensor.mul_(1.0 / 255.0)
-            return context_tensor
+            return self._convert_tensor(context_tensor)
 
     def _apply_transforms(
         self,
@@ -1191,7 +1270,7 @@ class RandomFaceWindowDataset(TorchDataset):
                 dtype=torch.float32,
             )
             metadata[1:].clamp_(0.0, 1.0)
-            return metadata
+            return self._convert_tensor(metadata)
 
     def _normalize_transforms(
         self, transforms: Optional[TransformType]
@@ -1306,8 +1385,23 @@ class RandomFaceWindowDataset(TorchDataset):
             raise ValueError("Visibility factors must be scalar values")
         return float(array.item())
 
-    @staticmethod
-    def _to_normalized_tensor(face_like: ArrayLike) -> torch.Tensor:
+    def _convert_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        target_dtype = self._tensor_dtype if dtype is None else dtype
+        target_device = self._tensor_device if device is None else device
+        if tensor.dtype != target_dtype or tensor.device != target_device:
+            try:
+                tensor = tensor.to(device=target_device, dtype=target_dtype, copy=False)
+            except TypeError:
+                tensor = tensor.to(device=target_device, dtype=target_dtype)
+        return tensor
+
+    def _to_normalized_tensor(self, face_like: ArrayLike) -> torch.Tensor:
         if isinstance(face_like, torch.Tensor):
             tensor = face_like.detach()
             if tensor.ndim == 2:
@@ -1323,7 +1417,7 @@ class RandomFaceWindowDataset(TorchDataset):
             max_val = tensor.max()
             if max_val > 1.0:
                 tensor = tensor / 255.0
-            return tensor
+            return self._convert_tensor(tensor)
 
         if isinstance(face_like, Image.Image):
             np_face = np.array(face_like)
@@ -1343,7 +1437,7 @@ class RandomFaceWindowDataset(TorchDataset):
             tensor.mul_(1.0 / 255.0)
         elif tensor.max() > 1.0:
             tensor.mul_(1.0 / 255.0)
-        return tensor
+        return self._convert_tensor(tensor)
 def _resolve_multiprocessing_context() -> mp.context.BaseContext:
     available = mp.get_all_start_methods()
     method = "fork" if "fork" in available else "spawn"
