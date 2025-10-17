@@ -175,7 +175,9 @@ class RandomFaceWindowDataset(TorchDataset):
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         self._cache_cameras = cache_cameras
-        self._tensor_device: torch.device = torch.device("cpu")
+        self._tensor_device: torch.device = (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
         self._tensor_dtype: torch.dtype = torch.float32
         self._camera_cache: Dict[Optional[int], Dict[str, CameraData]] = {}
         self._mp_pool: Optional[mp.pool.Pool] = None
@@ -247,7 +249,11 @@ class RandomFaceWindowDataset(TorchDataset):
         if "_reset_rng_each_epoch" not in self.__dict__:
             self._reset_rng_each_epoch = False
         if "_tensor_device" not in self.__dict__:
-            self._tensor_device = torch.device("cpu")
+            self._tensor_device = (
+                torch.device("cuda")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
         if "_tensor_dtype" not in self.__dict__:
             self._tensor_dtype = torch.float32
 

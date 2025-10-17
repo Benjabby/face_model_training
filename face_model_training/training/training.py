@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import warnings
+import math
 from contextlib import nullcontext
 import inspect
 from time import perf_counter
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from torch.profiler import ProfilerActivity, profile as torch_profile
 
@@ -71,56 +70,9 @@ def _resolve_device(device: Optional[torch.device]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _resolve_dataset_device(dataset: RandomFaceWindowDataset) -> torch.device:
-    if hasattr(dataset, "tensor_device"):
-        device = getattr(dataset, "tensor_device")
-        if isinstance(device, torch.device):
-            return device
-    if hasattr(dataset, "_tensor_device"):
-        device = getattr(dataset, "_tensor_device")
-        if isinstance(device, torch.device):
-            return device
-    return torch.device("cpu")
-
-
-def _make_dataloader(
-    dataset: RandomFaceWindowDataset,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    pin_memory: Optional[bool],
-) -> DataLoader:
-    dataset_device = _resolve_dataset_device(dataset)
-    worker_count = num_workers
-    if dataset_device.type == "cuda" and worker_count > 0:
-        warnings.warn(
-            "RandomFaceWindowDataset materializes CUDA tensors; forcing num_workers=0 to avoid "
-            "spawning multiple CUDA contexts in DataLoader workers.",
-            RuntimeWarning,
-        )
-        worker_count = 0
-
-    if dataset_device.type == "cuda":
-        use_pin_memory = False
-    else:
-        use_pin_memory = pin_memory if pin_memory is not None else torch.cuda.is_available()
-
-    loader_kwargs = dict(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=worker_count,
-        pin_memory=use_pin_memory,
-    )
-    if worker_count > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 4
-    return DataLoader(**loader_kwargs)
-
-
 def train_one_epoch(
     model: Combined,
-    dataloader: DataLoader,
+    dataloader: Iterable[tuple[Tensor, Tensor, Tensor]],
     optimizer: Optimizer,
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
@@ -175,7 +127,7 @@ def train_one_epoch(
 
 def evaluate(
     model: Combined,
-    dataloader: DataLoader,
+    dataloader: Iterable[tuple[Tensor, Tensor, Tensor]],
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
     *,
@@ -222,7 +174,15 @@ def train(
     grad_scaler: Optional[GradScaler] = None,
     profile_epoch: bool = False,
 ) -> Dict[str, list]:
-    """Train a combined model using :class:`RandomFaceWindowDataset` samples."""
+    """Train a combined model using :class:`RandomFaceWindowDataset` samples.
+
+    The dataset itself drives iteration, mirroring the ``RandomFaceWindowDataset``
+    interface instead of wrapping it in a :class:`~torch.utils.data.DataLoader`.
+    This keeps the dataset's multiprocessing pool and tensor configuration
+    intact while still allowing the training loop to treat the object like a
+    standard batch iterable.  The ``pin_memory`` argument is retained for API
+    compatibility but ignored because no external ``DataLoader`` is built.
+    """
 
     if train_dataset is None:
         train_dataset = RandomFaceWindowDataset(**(train_dataset_kwargs or {}))
@@ -252,14 +212,17 @@ def train(
     loss_fn = loss_fn or masked_mse_loss
     scaler = grad_scaler or _create_grad_scaler(amp_enabled)
 
-    train_loader = _make_dataloader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
-    )
-    val_loader = None
+    if train_dataset.batch_size != batch_size:
+        train_dataset.set_batch_size(batch_size)
+    train_dataset.set_num_processes(num_workers)
+    train_loader: Iterable[tuple[Tensor, Tensor, Tensor]] = train_dataset
+
+    val_loader: Optional[Iterable[tuple[Tensor, Tensor, Tensor]]] = None
     if val_dataset is not None:
-        val_loader = _make_dataloader(
-            val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
-        )
+        if val_dataset.batch_size != batch_size:
+            val_dataset.set_batch_size(batch_size)
+        val_dataset.set_num_processes(num_workers)
+        val_loader = val_dataset
 
     history: Dict[str, list] = {"train_loss": []}
     if val_loader is not None:
@@ -279,10 +242,14 @@ def train(
             total_batches = None
         progress_update_by = "batches"
         dataset_epoch_total = None
-        train_dataset_ref = getattr(train_loader, "dataset", None)
-        if train_dataset_ref is not None and hasattr(train_dataset_ref, "epoch_size"):
+        if hasattr(train_loader, "epoch_size"):
             try:
-                dataset_epoch_total = int(getattr(train_dataset_ref, "epoch_size"))
+                dataset_epoch_total = int(getattr(train_loader, "epoch_size"))
+            except (TypeError, ValueError):
+                dataset_epoch_total = None
+        elif hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "epoch_size"):
+            try:
+                dataset_epoch_total = int(getattr(train_loader.dataset, "epoch_size"))
             except (TypeError, ValueError):
                 dataset_epoch_total = None
         if dataset_epoch_total is not None and dataset_epoch_total > 0:
@@ -371,7 +338,7 @@ def _autocast_context(device: torch.device, enabled: bool):
 
 def _profile_train_epoch(
     model: Combined,
-    dataloader: DataLoader,
+    dataloader: Iterable[tuple[Tensor, Tensor, Tensor]],
     optimizer: Optimizer,
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
@@ -379,7 +346,6 @@ def _profile_train_epoch(
     amp_enabled: bool,
     scaler: GradScaler,
     progress_bar: Optional[tqdm] = None,
-    *,
     progress_update_by: str = "batches",
 ) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]
@@ -402,9 +368,14 @@ def _profile_train_epoch(
         "optimizer": 0.0,
     }
 
-    dataset = getattr(dataloader, "dataset", None)
-    dataset_instrumented = isinstance(dataset, RandomFaceWindowDataset)
-    dataset_worker_warning = dataset_instrumented and getattr(dataloader, "num_workers", 0) > 0
+    if isinstance(dataloader, RandomFaceWindowDataset):
+        dataset = dataloader
+        dataset_instrumented = True
+        dataset_worker_warning = False
+    else:
+        dataset = getattr(dataloader, "dataset", None)
+        dataset_instrumented = isinstance(dataset, RandomFaceWindowDataset)
+        dataset_worker_warning = dataset_instrumented and getattr(dataloader, "num_workers", 0) > 0
     dataset_timings: Dict[str, Dict[str, float]] = {}
     if dataset_instrumented:
         dataset.enable_timing(reset=True)

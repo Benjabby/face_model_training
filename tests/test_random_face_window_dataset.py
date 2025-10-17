@@ -20,7 +20,9 @@ def _make_dataset_stub() -> RandomFaceWindowDataset:
     dataset.seed = None
     dataset.rng = np.random.default_rng()
     dataset._cache_cameras = False
-    dataset._tensor_device = torch.device("cpu")
+    dataset._tensor_device = (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
     dataset._tensor_dtype = torch.float32
     dataset._camera_cache = {}
     dataset._mp_pool = None
@@ -82,7 +84,8 @@ def test_prepare_context_frame_uses_target_options() -> None:
 def test_tensor_device_property_tracks_switches() -> None:
     dataset = _make_dataset_stub()
 
-    assert dataset.tensor_device.type == "cpu"
+    expected_type = "cuda" if torch.cuda.is_available() else "cpu"
+    assert dataset.tensor_device.type == expected_type
 
     dataset.cpu()
     assert dataset.tensor_device.type == "cpu"
@@ -170,6 +173,8 @@ def test_read_face_window_produces_expected_channels() -> None:
 def test_cuda_switch_matches_availability() -> None:
     dataset = _make_dataset_stub()
     if torch.cuda.is_available():
+        assert dataset._tensor_device.type == "cuda"
+        dataset.cpu()
         dataset.cuda()
         assert dataset._tensor_device.type == "cuda"
     else:
