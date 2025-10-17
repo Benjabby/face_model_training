@@ -503,6 +503,18 @@ class RandomFaceWindowDataset(TorchDataset):
     def batch_size(self) -> int:
         return self._batch_size
 
+    @property
+    def tensor_device(self) -> torch.device:
+        """Return the device new tensors are materialized on."""
+
+        return self._tensor_device
+
+    @property
+    def tensor_dtype(self) -> torch.dtype:
+        """Return the dtype new tensors are materialized with."""
+
+        return self._tensor_dtype
+
     def set_batch_size(self, batch_size: int) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")

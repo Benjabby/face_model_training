@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from contextlib import nullcontext
 import inspect
 from time import perf_counter
@@ -70,6 +71,18 @@ def _resolve_device(device: Optional[torch.device]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _resolve_dataset_device(dataset: RandomFaceWindowDataset) -> torch.device:
+    if hasattr(dataset, "tensor_device"):
+        device = getattr(dataset, "tensor_device")
+        if isinstance(device, torch.device):
+            return device
+    if hasattr(dataset, "_tensor_device"):
+        device = getattr(dataset, "_tensor_device")
+        if isinstance(device, torch.device):
+            return device
+    return torch.device("cpu")
+
+
 def _make_dataloader(
     dataset: RandomFaceWindowDataset,
     batch_size: int,
@@ -77,15 +90,29 @@ def _make_dataloader(
     num_workers: int,
     pin_memory: Optional[bool],
 ) -> DataLoader:
-    use_pin_memory = pin_memory if pin_memory is not None else torch.cuda.is_available()
+    dataset_device = _resolve_dataset_device(dataset)
+    worker_count = num_workers
+    if dataset_device.type == "cuda" and worker_count > 0:
+        warnings.warn(
+            "RandomFaceWindowDataset materializes CUDA tensors; forcing num_workers=0 to avoid "
+            "spawning multiple CUDA contexts in DataLoader workers.",
+            RuntimeWarning,
+        )
+        worker_count = 0
+
+    if dataset_device.type == "cuda":
+        use_pin_memory = False
+    else:
+        use_pin_memory = pin_memory if pin_memory is not None else torch.cuda.is_available()
+
     loader_kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=num_workers,
+        num_workers=worker_count,
         pin_memory=use_pin_memory,
     )
-    if num_workers > 0:
+    if worker_count > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
     return DataLoader(**loader_kwargs)
@@ -352,6 +379,7 @@ def _profile_train_epoch(
     amp_enabled: bool,
     scaler: GradScaler,
     progress_bar: Optional[tqdm] = None,
+    *,
     progress_update_by: str = "batches",
 ) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]

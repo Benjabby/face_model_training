@@ -38,10 +38,12 @@ def test_dtype_switch_affects_metadata() -> None:
 
     meta = dataset._build_face_metadata((0, 0, 1, 1), 0.5, (10, 10, 3))
     assert meta.dtype == torch.float32
+    assert dataset.tensor_dtype == torch.float32
 
     dataset.double()
     meta64 = dataset._build_face_metadata((0, 0, 1, 1), 0.5, (10, 10, 3))
     assert meta64.dtype == torch.float64
+    assert dataset.tensor_dtype == torch.float64
 
 
 def test_slice_heart_rates_respects_device_and_dtype() -> None:
@@ -75,6 +77,19 @@ def test_prepare_context_frame_uses_target_options() -> None:
     assert context.device == dataset._tensor_device
     assert context.dtype == dataset._tensor_dtype
     assert context.dtype == torch.float64
+
+
+def test_tensor_device_property_tracks_switches() -> None:
+    dataset = _make_dataset_stub()
+
+    assert dataset.tensor_device.type == "cpu"
+
+    dataset.cpu()
+    assert dataset.tensor_device.type == "cpu"
+
+    if torch.cuda.is_available():
+        dataset.cuda()
+        assert dataset.tensor_device.type == "cuda"
 
 
 class _DummyCamera:
