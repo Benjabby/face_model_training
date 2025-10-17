@@ -352,7 +352,6 @@ def _profile_train_epoch(
     amp_enabled: bool,
     scaler: GradScaler,
     progress_bar: Optional[tqdm] = None,
-    *,
     progress_update_by: str = "batches",
 ) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]

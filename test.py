@@ -11,3 +11,5 @@ try:
     breakpoint()
 except KeyboardInterrupt:
     breakpoint()
+except Exception as e:
+    raise e
