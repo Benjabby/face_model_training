@@ -101,6 +101,7 @@ def train_one_epoch(
     amp_enabled: bool = False,
     scaler: Optional[GradScaler] = None,
     progress_bar: Optional[tqdm] = None,
+    progress_update_by: str = "batches",
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -130,7 +131,11 @@ def train_one_epoch(
         batches += 1
 
         if progress_bar is not None:
-            progress_bar.update(1)
+            if progress_update_by == "samples" and hasattr(frames, "shape") and frames.shape:
+                increment = int(frames.shape[0])
+            else:
+                increment = 1
+            progress_bar.update(increment)
             avg_loss = running_loss / batches
             progress_bar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
 
@@ -245,7 +250,18 @@ def train(
             total_batches = len(train_loader)
         except TypeError:
             total_batches = None
-        if total_batches is not None:
+        progress_update_by = "batches"
+        dataset_epoch_total = None
+        train_dataset_ref = getattr(train_loader, "dataset", None)
+        if train_dataset_ref is not None and hasattr(train_dataset_ref, "epoch_size"):
+            try:
+                dataset_epoch_total = int(getattr(train_dataset_ref, "epoch_size"))
+            except (TypeError, ValueError):
+                dataset_epoch_total = None
+        if dataset_epoch_total is not None and dataset_epoch_total > 0:
+            epoch_bar_kwargs["total"] = dataset_epoch_total
+            progress_update_by = "samples"
+        elif total_batches is not None:
             epoch_bar_kwargs["total"] = total_batches
 
         with tqdm(**epoch_bar_kwargs) as epoch_progress:
@@ -259,6 +275,7 @@ def train(
                     amp_enabled=amp_enabled,
                     scaler=scaler,
                     progress_bar=epoch_progress,
+                    progress_update_by=progress_update_by,
                 )
                 for line in profiler_lines:
                     tqdm.write(line)
@@ -274,6 +291,7 @@ def train(
                     amp_enabled=amp_enabled,
                     scaler=scaler,
                     progress_bar=epoch_progress,
+                    progress_update_by=progress_update_by,
                 )
         history["train_loss"].append(train_loss)
 
@@ -334,6 +352,8 @@ def _profile_train_epoch(
     amp_enabled: bool,
     scaler: GradScaler,
     progress_bar: Optional[tqdm] = None,
+    *,
+    progress_update_by: str = "batches",
 ) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda" and torch.cuda.is_available():
@@ -406,7 +426,11 @@ def _profile_train_epoch(
                 running_loss += loss.item()
                 batches += 1
                 if progress_bar is not None:
-                    progress_bar.update(1)
+                    if progress_update_by == "samples" and hasattr(frames, "shape") and frames.shape:
+                        increment = int(frames.shape[0])
+                    else:
+                        increment = 1
+                    progress_bar.update(increment)
                     avg_loss = running_loss / batches
                     progress_bar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
                 batch_wait_start = perf_counter()
