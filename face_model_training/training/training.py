@@ -100,6 +100,8 @@ def train_one_epoch(
     *,
     amp_enabled: bool = False,
     scaler: Optional[GradScaler] = None,
+    progress_bar: Optional[tqdm] = None,
+    progress_update_by: str = "batches",
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -128,7 +130,20 @@ def train_one_epoch(
         running_loss += loss.item()
         batches += 1
 
-    return running_loss / max(batches, 1)
+        if progress_bar is not None:
+            if progress_update_by == "samples" and hasattr(frames, "shape") and frames.shape:
+                increment = int(frames.shape[0])
+            else:
+                increment = 1
+            progress_bar.update(increment)
+            avg_loss = running_loss / batches
+            progress_bar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
+
+    average_loss = running_loss / max(batches, 1)
+    if progress_bar is not None:
+        progress_bar.set_postfix({"avg_loss": f"{average_loss:.4f}"})
+
+    return average_loss
 
 
 def evaluate(
@@ -225,30 +240,59 @@ def train(
 
     progress_bar = tqdm(range(1, epochs + 1), desc="Training", unit="epoch")
     for epoch_idx in progress_bar:
-        if profile_epoch and epoch_idx == 1:
-            train_loss, profiler_lines, profiler_tables = _profile_train_epoch(
-                model,
-                train_loader,
-                optimizer,
-                loss_fn,
-                resolved_device,
-                amp_enabled=amp_enabled,
-                scaler=scaler,
-            )
-            for line in profiler_lines:
-                tqdm.write(line)
-            for table in profiler_tables:
-                tqdm.write(table)
-        else:
-            train_loss = train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                loss_fn,
-                resolved_device,
-                amp_enabled=amp_enabled,
-                scaler=scaler,
-            )
+        epoch_bar_kwargs = {
+            "desc": f"Epoch {epoch_idx}",
+            "unit": "batch",
+            "leave": False,
+            "position": 1,
+        }
+        try:
+            total_batches = len(train_loader)
+        except TypeError:
+            total_batches = None
+        progress_update_by = "batches"
+        dataset_epoch_total = None
+        train_dataset_ref = getattr(train_loader, "dataset", None)
+        if train_dataset_ref is not None and hasattr(train_dataset_ref, "epoch_size"):
+            try:
+                dataset_epoch_total = int(getattr(train_dataset_ref, "epoch_size"))
+            except (TypeError, ValueError):
+                dataset_epoch_total = None
+        if dataset_epoch_total is not None and dataset_epoch_total > 0:
+            epoch_bar_kwargs["total"] = dataset_epoch_total
+            progress_update_by = "samples"
+        elif total_batches is not None:
+            epoch_bar_kwargs["total"] = total_batches
+
+        with tqdm(**epoch_bar_kwargs) as epoch_progress:
+            if profile_epoch and epoch_idx == 1:
+                train_loss, profiler_lines, profiler_tables = _profile_train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    loss_fn,
+                    resolved_device,
+                    amp_enabled=amp_enabled,
+                    scaler=scaler,
+                    progress_bar=epoch_progress,
+                    progress_update_by=progress_update_by,
+                )
+                for line in profiler_lines:
+                    tqdm.write(line)
+                for table in profiler_tables:
+                    tqdm.write(table)
+            else:
+                train_loss = train_one_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    loss_fn,
+                    resolved_device,
+                    amp_enabled=amp_enabled,
+                    scaler=scaler,
+                    progress_bar=epoch_progress,
+                    progress_update_by=progress_update_by,
+                )
         history["train_loss"].append(train_loss)
 
         if val_loader is not None:
@@ -307,6 +351,9 @@ def _profile_train_epoch(
     *,
     amp_enabled: bool,
     scaler: GradScaler,
+    progress_bar: Optional[tqdm] = None,
+    *,
+    progress_update_by: str = "batches",
 ) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda" and torch.cuda.is_available():
@@ -378,6 +425,14 @@ def _profile_train_epoch(
 
                 running_loss += loss.item()
                 batches += 1
+                if progress_bar is not None:
+                    if progress_update_by == "samples" and hasattr(frames, "shape") and frames.shape:
+                        increment = int(frames.shape[0])
+                    else:
+                        increment = 1
+                    progress_bar.update(increment)
+                    avg_loss = running_loss / batches
+                    progress_bar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
                 batch_wait_start = perf_counter()
 
             loss = running_loss / max(batches, 1)
@@ -386,6 +441,9 @@ def _profile_train_epoch(
             dataset_timings = dataset.collect_timings(reset=True)
             dataset.disable_timing()
     duration = perf_counter() - start_time
+
+    if progress_bar is not None:
+        progress_bar.set_postfix({"avg_loss": f"{loss:.4f}"})
 
     summary = profiler.key_averages().total_average()
     cpu_time_ms = getattr(summary, "cpu_time_total", 0.0)
