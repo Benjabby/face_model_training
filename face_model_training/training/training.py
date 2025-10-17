@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 import inspect
 from time import perf_counter
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from torch.profiler import ProfilerActivity, profile as torch_profile
 
@@ -70,36 +70,17 @@ def _resolve_device(device: Optional[torch.device]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _make_dataloader(
-    dataset: RandomFaceWindowDataset,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    pin_memory: Optional[bool],
-) -> DataLoader:
-    use_pin_memory = pin_memory if pin_memory is not None else torch.cuda.is_available()
-    loader_kwargs = dict(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=use_pin_memory,
-    )
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 4
-    return DataLoader(**loader_kwargs)
-
-
 def train_one_epoch(
     model: Combined,
-    dataloader: DataLoader,
+    dataloader: Iterable[tuple[Tensor, Tensor, Tensor]],
     optimizer: Optimizer,
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
     *,
     amp_enabled: bool = False,
     scaler: Optional[GradScaler] = None,
+    progress_bar: Optional[tqdm] = None,
+    progress_update_by: str = "batches",
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -128,12 +109,25 @@ def train_one_epoch(
         running_loss += loss.item()
         batches += 1
 
-    return running_loss / max(batches, 1)
+        if progress_bar is not None:
+            if progress_update_by == "samples" and hasattr(frames, "shape") and frames.shape:
+                increment = int(frames.shape[0])
+            else:
+                increment = 1
+            progress_bar.update(increment)
+            avg_loss = running_loss / batches
+            progress_bar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
+
+    average_loss = running_loss / max(batches, 1)
+    if progress_bar is not None:
+        progress_bar.set_postfix({"avg_loss": f"{average_loss:.4f}"})
+
+    return average_loss
 
 
 def evaluate(
     model: Combined,
-    dataloader: DataLoader,
+    dataloader: Iterable[tuple[Tensor, Tensor, Tensor]],
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
     *,
@@ -180,7 +174,15 @@ def train(
     grad_scaler: Optional[GradScaler] = None,
     profile_epoch: bool = False,
 ) -> Dict[str, list]:
-    """Train a combined model using :class:`RandomFaceWindowDataset` samples."""
+    """Train a combined model using :class:`RandomFaceWindowDataset` samples.
+
+    The dataset itself drives iteration, mirroring the ``RandomFaceWindowDataset``
+    interface instead of wrapping it in a :class:`~torch.utils.data.DataLoader`.
+    This keeps the dataset's multiprocessing pool and tensor configuration
+    intact while still allowing the training loop to treat the object like a
+    standard batch iterable.  The ``pin_memory`` argument is retained for API
+    compatibility but ignored because no external ``DataLoader`` is built.
+    """
 
     if train_dataset is None:
         train_dataset = RandomFaceWindowDataset(**(train_dataset_kwargs or {}))
@@ -210,14 +212,17 @@ def train(
     loss_fn = loss_fn or masked_mse_loss
     scaler = grad_scaler or _create_grad_scaler(amp_enabled)
 
-    train_loader = _make_dataloader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
-    )
-    val_loader = None
+    if train_dataset.batch_size != batch_size:
+        train_dataset.set_batch_size(batch_size)
+    train_dataset.set_num_processes(num_workers)
+    train_loader: Iterable[tuple[Tensor, Tensor, Tensor]] = train_dataset
+
+    val_loader: Optional[Iterable[tuple[Tensor, Tensor, Tensor]]] = None
     if val_dataset is not None:
-        val_loader = _make_dataloader(
-            val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
-        )
+        if val_dataset.batch_size != batch_size:
+            val_dataset.set_batch_size(batch_size)
+        val_dataset.set_num_processes(num_workers)
+        val_loader = val_dataset
 
     history: Dict[str, list] = {"train_loss": []}
     if val_loader is not None:
@@ -225,30 +230,63 @@ def train(
 
     progress_bar = tqdm(range(1, epochs + 1), desc="Training", unit="epoch")
     for epoch_idx in progress_bar:
-        if profile_epoch and epoch_idx == 1:
-            train_loss, profiler_lines, profiler_tables = _profile_train_epoch(
-                model,
-                train_loader,
-                optimizer,
-                loss_fn,
-                resolved_device,
-                amp_enabled=amp_enabled,
-                scaler=scaler,
-            )
-            for line in profiler_lines:
-                tqdm.write(line)
-            for table in profiler_tables:
-                tqdm.write(table)
-        else:
-            train_loss = train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                loss_fn,
-                resolved_device,
-                amp_enabled=amp_enabled,
-                scaler=scaler,
-            )
+        epoch_bar_kwargs = {
+            "desc": f"Epoch {epoch_idx}",
+            "unit": "batch",
+            "leave": False,
+            "position": 1,
+        }
+        try:
+            total_batches = len(train_loader)
+        except TypeError:
+            total_batches = None
+        progress_update_by = "batches"
+        dataset_epoch_total = None
+        if hasattr(train_loader, "epoch_size"):
+            try:
+                dataset_epoch_total = int(getattr(train_loader, "epoch_size"))
+            except (TypeError, ValueError):
+                dataset_epoch_total = None
+        elif hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "epoch_size"):
+            try:
+                dataset_epoch_total = int(getattr(train_loader.dataset, "epoch_size"))
+            except (TypeError, ValueError):
+                dataset_epoch_total = None
+        if dataset_epoch_total is not None and dataset_epoch_total > 0:
+            epoch_bar_kwargs["total"] = dataset_epoch_total
+            progress_update_by = "samples"
+        elif total_batches is not None:
+            epoch_bar_kwargs["total"] = total_batches
+
+        with tqdm(**epoch_bar_kwargs) as epoch_progress:
+            if profile_epoch and epoch_idx == 1:
+                train_loss, profiler_lines, profiler_tables = _profile_train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    loss_fn,
+                    resolved_device,
+                    amp_enabled=amp_enabled,
+                    scaler=scaler,
+                    progress_bar=epoch_progress,
+                    progress_update_by=progress_update_by,
+                )
+                for line in profiler_lines:
+                    tqdm.write(line)
+                for table in profiler_tables:
+                    tqdm.write(table)
+            else:
+                train_loss = train_one_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    loss_fn,
+                    resolved_device,
+                    amp_enabled=amp_enabled,
+                    scaler=scaler,
+                    progress_bar=epoch_progress,
+                    progress_update_by=progress_update_by,
+                )
         history["train_loss"].append(train_loss)
 
         if val_loader is not None:
@@ -300,13 +338,15 @@ def _autocast_context(device: torch.device, enabled: bool):
 
 def _profile_train_epoch(
     model: Combined,
-    dataloader: DataLoader,
+    dataloader: Iterable[tuple[Tensor, Tensor, Tensor]],
     optimizer: Optimizer,
     loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
     device: torch.device,
     *,
     amp_enabled: bool,
     scaler: GradScaler,
+    progress_bar: Optional[tqdm] = None,
+    progress_update_by: str = "batches",
 ) -> tuple[float, list[str], List[str]]:
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda" and torch.cuda.is_available():
@@ -328,9 +368,14 @@ def _profile_train_epoch(
         "optimizer": 0.0,
     }
 
-    dataset = getattr(dataloader, "dataset", None)
-    dataset_instrumented = isinstance(dataset, RandomFaceWindowDataset)
-    dataset_worker_warning = dataset_instrumented and getattr(dataloader, "num_workers", 0) > 0
+    if isinstance(dataloader, RandomFaceWindowDataset):
+        dataset = dataloader
+        dataset_instrumented = True
+        dataset_worker_warning = False
+    else:
+        dataset = getattr(dataloader, "dataset", None)
+        dataset_instrumented = isinstance(dataset, RandomFaceWindowDataset)
+        dataset_worker_warning = dataset_instrumented and getattr(dataloader, "num_workers", 0) > 0
     dataset_timings: Dict[str, Dict[str, float]] = {}
     if dataset_instrumented:
         dataset.enable_timing(reset=True)
@@ -378,6 +423,14 @@ def _profile_train_epoch(
 
                 running_loss += loss.item()
                 batches += 1
+                if progress_bar is not None:
+                    if progress_update_by == "samples" and hasattr(frames, "shape") and frames.shape:
+                        increment = int(frames.shape[0])
+                    else:
+                        increment = 1
+                    progress_bar.update(increment)
+                    avg_loss = running_loss / batches
+                    progress_bar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
                 batch_wait_start = perf_counter()
 
             loss = running_loss / max(batches, 1)
@@ -386,6 +439,9 @@ def _profile_train_epoch(
             dataset_timings = dataset.collect_timings(reset=True)
             dataset.disable_timing()
     duration = perf_counter() - start_time
+
+    if progress_bar is not None:
+        progress_bar.set_postfix({"avg_loss": f"{loss:.4f}"})
 
     summary = profiler.key_averages().total_average()
     cpu_time_ms = getattr(summary, "cpu_time_total", 0.0)
