@@ -136,6 +136,7 @@ class RandomFaceWindowDataset(TorchDataset):
         num_processes: Optional[int] = None,
         seed: Optional[int] = None,
         cache_cameras: bool = True,
+        augment_scale = 0.5
     ) -> None:
         super().__init__()
 
@@ -162,10 +163,11 @@ class RandomFaceWindowDataset(TorchDataset):
             Callable[[ArrayLike, np.random.Generator], ArrayLike], ...
         ] = ()
         if pre_face_transforms is None:
-            pre_face_transforms = default_pre_face_transforms()
+            pre_face_transforms = default_pre_face_transforms(probability_scale=augment_scale)
         if post_face_transforms is None:
             post_face_transforms = default_post_face_transforms(
-                window_size=self.window_size
+                window_size=self.window_size,
+                probability_scale=augment_scale
             )
         self.pre_face_transforms = pre_face_transforms
         self.post_face_transforms = post_face_transforms
